@@ -6,6 +6,14 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum ConversionMode: String, CaseIterable, Identifiable {
+    case convert = "Convert"
+    case buildOnly = "Build Only"
+    case installOnly = "Install Only"
+
+    var id: String { rawValue }
+}
+
 struct Step: Identifiable {
     let id = UUID()
     let label: String
@@ -24,7 +32,7 @@ final class Runner: ObservableObject {
 
     private var process: Process?
 
-    func run(input: String, env: [String: String] = [:], buildOnly: Bool = false) {
+    func run(input: String, env: [String: String] = [:], mode: ConversionMode = .convert) {
         steps = []
         log = ""
         finished = false
@@ -33,8 +41,14 @@ final class Runner: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = buildOnly ? [Self.scriptPath, input, "--build-only"]
-                                   : [Self.scriptPath, input]
+        switch mode {
+        case .convert:
+            proc.arguments = [Self.scriptPath, input]
+        case .buildOnly:
+            proc.arguments = [Self.scriptPath, input, "--build-only"]
+        case .installOnly:
+            proc.arguments = [Self.scriptPath, "--install-only"]
+        }
         var environment = ProcessInfo.processInfo.environment
         for (key, value) in env where !value.trimmingCharacters(in: .whitespaces).isEmpty {
             environment[key] = value
@@ -89,17 +103,30 @@ struct ContentView: View {
     @State private var bundleID = ""
     @State private var teamID = ""
     @State private var outDir = ""
-    @State private var buildOnly = false
+    @State private var mode: ConversionMode = .convert
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            dropZone
+            Picker("Mode", selection: $mode) {
+                ForEach(ConversionMode.allCases) { m in
+                    Text(m.rawValue).tag(m)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(runner.running)
+
+            if mode != .installOnly {
+                dropZone
+            }
 
             VStack(spacing: 12) {
                 HStack(spacing: 8) {
-                    Image(systemName: "link")
+                    Image(systemName: mode == .installOnly ? "folder" : "link")
                         .foregroundStyle(.secondary)
-                    TextField("Store link or folder path", text: $input)
+                    TextField(mode == .installOnly
+                              ? "Path to converted output folder"
+                              : "Store link or folder path",
+                              text: $input)
                         .textFieldStyle(.roundedBorder)
                         .disabled(runner.running)
                         .onSubmit(convert)
@@ -111,7 +138,7 @@ struct ContentView: View {
                             ProgressView()
                                 .controlSize(.small)
                         }
-                        Text(runner.running ? "Converting…" : "Convert")
+                        Text(runner.running ? runningLabel : buttonLabel)
                             .fontWeight(.medium)
                     }
                     .frame(maxWidth: .infinity)
@@ -141,10 +168,6 @@ struct ContentView: View {
                                 .textFieldStyle(.roundedBorder)
                             Button("…", action: chooseOutDir)
                         }
-                    }
-                    GridRow {
-                        Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
-                        Toggle("Build only, don't install to /Applications", isOn: $buildOnly)
                     }
                 }
                 .font(.callout)
@@ -253,9 +276,7 @@ struct ContentView: View {
         return HStack(spacing: 10) {
             Image(systemName: ok ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(ok ? Color.green : Color.red)
-            Text(ok ? (buildOnly ? "Done. The built app is in the output folder — see the log for the path."
-                                 : "Done. Enable it in Safari → Settings → Extensions.")
-                    : "Failed. See the log below for details.")
+            Text(ok ? successMessage : "Failed. See the log below for details.")
                 .font(.callout.weight(.medium))
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -266,13 +287,41 @@ struct ContentView: View {
         .onAppear { if !ok { showLog = true } }
     }
 
+    private var successMessage: String {
+        switch mode {
+        case .convert:
+            return "Done. Enable it in Safari → Settings → Extensions."
+        case .buildOnly:
+            return "Done. The built app is in the output folder — see the log for the path."
+        case .installOnly:
+            return "Done. Enable it in Safari → Settings → Extensions."
+        }
+    }
+
+    private var buttonLabel: String {
+        switch mode {
+        case .convert:       return "Convert"
+        case .buildOnly:     return "Build"
+        case .installOnly:   return "Rebuild & Install"
+        }
+    }
+
+    private var runningLabel: String {
+        switch mode {
+        case .convert:       return "Converting…"
+        case .buildOnly:     return "Building…"
+        case .installOnly:   return "Rebuilding…"
+        }
+    }
+
     private func convert() {
         let value = input.trimmingCharacters(in: .whitespaces)
         guard !value.isEmpty, !runner.running else { return }
-        runner.run(input: value,
-                   env: ["APP_NAME": appName, "BUNDLE_ID": bundleID,
-                         "TEAM_ID": teamID, "OUT_DIR": outDir],
-                   buildOnly: buildOnly)
+        var env = ["APP_NAME": appName, "BUNDLE_ID": bundleID, "TEAM_ID": teamID, "OUT_DIR": outDir]
+        if mode == .installOnly {
+            env["OUT_DIR"] = value
+        }
+        runner.run(input: value, env: env, mode: mode)
     }
 
     private func optionRow(_ label: String, _ defaultHint: String, _ text: Binding<String>) -> some View {

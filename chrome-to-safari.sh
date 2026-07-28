@@ -8,6 +8,7 @@ set -euo pipefail
 #   ./chrome-to-safari.sh /path/to/extension              # convert + build + install + launch
 #   ./chrome-to-safari.sh <chrome-web-store-url>          # download from the store, then same
 #   ./chrome-to-safari.sh /path/to/extension --build-only # convert + build, don't install
+#   OUT_DIR=/path/to/ext-safari ./chrome-to-safari.sh --install-only  # rebuild + install from existing project
 #   ./chrome-to-safari.sh --ui                            # open the native app UI
 #
 # Env overrides (all optional):
@@ -28,6 +29,74 @@ if [ "${1:-}" = "--ui" ]; then
     swiftc -O -parse-as-library "$UI_SRC" -o "$UI_BIN"
   fi
   exec env C2S_SCRIPT="$SCRIPT_DIR/chrome-to-safari.sh" "$UI_BIN"
+fi
+
+# --- Install-only mode: rebuild + install from an existing converted project ---
+if [ "${1:-}" = "--install-only" ]; then
+  if [ -z "${OUT_DIR:-}" ]; then
+    echo "ERROR: --install-only requires OUT_DIR to point to the converted project directory." >&2
+    echo "  Example: OUT_DIR=/path/to/ext-safari ./chrome-to-safari.sh --install-only" >&2
+    exit 1
+  fi
+
+  # Auto-detect APP_NAME from the project if not set
+  if [ -z "${APP_NAME:-}" ]; then
+    APP_NAME="$(basename "$OUT_DIR" | sed 's/-safari$//')"
+  fi
+
+  PROJECT="$OUT_DIR/$APP_NAME/$APP_NAME.xcodeproj"
+  if [ ! -d "$PROJECT" ]; then
+    echo "ERROR: Xcode project not found at $PROJECT" >&2
+    echo "  Make sure OUT_DIR points to the directory created by --build-only." >&2
+    exit 1
+  fi
+
+  # Signing identity
+  TEAM_ID="${TEAM_ID:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+    | openssl x509 -noout -subject 2>/dev/null \
+    | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p')}"
+  if [ -z "$TEAM_ID" ]; then
+    echo "ERROR: No Apple Development certificate found." >&2
+    exit 1
+  fi
+  echo "==> App name:  $APP_NAME"
+  echo "==> Team ID:   $TEAM_ID"
+
+  echo "==> Building..."
+  rm -rf "$OUT_DIR/build/Build/Products"
+  xcodebuild \
+    -project "$PROJECT" \
+    -scheme "$APP_NAME" \
+    -configuration Release \
+    -derivedDataPath "$OUT_DIR/build" \
+    -allowProvisioningUpdates \
+    DEVELOPMENT_TEAM="$TEAM_ID" \
+    CODE_SIGN_STYLE=Automatic \
+    build 2>&1 | grep -E "BUILD|error|Cycle"
+
+  APP="$OUT_DIR/build/Build/Products/Release/$APP_NAME.app"
+  if [ ! -d "$APP" ]; then
+    echo "ERROR: build product not found at $APP" >&2
+    exit 1
+  fi
+
+  echo "==> Verifying signature..."
+  codesign --verify --deep --strict "$APP"
+
+  echo "==> Installing to /Applications..."
+  rm -rf "/Applications/$APP_NAME.app"
+  mv "$APP" /Applications/
+
+  /System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister \
+    -f -R -trusted "/Applications/$APP_NAME.app"
+
+  open -a "/Applications/$APP_NAME.app"
+  sleep 2
+  open -a Safari
+
+  echo ""
+  echo "Done. Enable it in Safari > Settings > Extensions."
+  exit 0
 fi
 
 EXT_DIR="${1:?usage: chrome-to-safari.sh /path/to/extension|<store-url> [--build-only], or --ui}"
