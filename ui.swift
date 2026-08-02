@@ -124,7 +124,7 @@ struct ContentView: View {
                     Image(systemName: mode == .installOnly ? "folder" : "link")
                         .foregroundStyle(.secondary)
                     TextField(mode == .installOnly
-                              ? "Path to converted output folder"
+                              ? "Output folder created by Build Only"
                               : "Store link or folder path",
                               text: $input)
                         .textFieldStyle(.roundedBorder)

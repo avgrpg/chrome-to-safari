@@ -57,12 +57,12 @@ If you want to edit the converted extension before installing:
 #   The converted files are in: <output-dir>/<app-name>/
 
 # Step 3: Rebuild + install from the existing project
-OUT_DIR=/path/to/<slug>-safari ./chrome-to-safari.sh --install-only
+OUT_DIR=/path/to/output-folder ./chrome-to-safari.sh --install-only
 ```
 
 You can repeat step 2 and 3 as many times as you like — just edit the source and re-run `--install-only`.
 
-This also works in the UI — use the **Build Only** mode first, edit the extension in Xcode, then switch to **Install Only** and paste the output folder path.
+This also works in the UI — use the **Build Only** mode first, edit the extension in Xcode, then switch to **Install Only** and paste the same output folder path. The folder name itself does not matter; it must contain the converted project's `.xcodeproj` folder.
 
 ## Requirements
 

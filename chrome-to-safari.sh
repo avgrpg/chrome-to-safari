@@ -39,17 +39,23 @@ if [ "${1:-}" = "--install-only" ]; then
     exit 1
   fi
 
-  # Auto-detect APP_NAME from the project if not set
-  if [ -z "${APP_NAME:-}" ]; then
-    APP_NAME="$(basename "$OUT_DIR" | sed 's/-safari$//')"
-  fi
-
-  PROJECT="$OUT_DIR/$APP_NAME/$APP_NAME.xcodeproj"
-  if [ ! -d "$PROJECT" ]; then
-    echo "ERROR: Xcode project not found at $PROJECT" >&2
-    echo "  Make sure OUT_DIR points to the directory created by --build-only." >&2
+  # The output directory can have any name. Find the project generated inside it
+  # instead of assuming its name is derived from the output folder name.
+  shopt -s nullglob
+  PROJECTS=("$OUT_DIR"/*/*.xcodeproj)
+  shopt -u nullglob
+  if [ "${#PROJECTS[@]}" -eq 0 ]; then
+    echo "ERROR: No Xcode project found inside $OUT_DIR" >&2
+    echo "  Select the output folder created by --build-only, not its build subfolder." >&2
     exit 1
   fi
+  if [ "${#PROJECTS[@]}" -gt 1 ]; then
+    echo "ERROR: Multiple Xcode projects found inside $OUT_DIR" >&2
+    echo "  Select an output folder containing only one converted project." >&2
+    exit 1
+  fi
+  PROJECT="${PROJECTS[0]}"
+  APP_NAME="$(basename "$PROJECT" .xcodeproj)"
 
   # Signing identity
   TEAM_ID="${TEAM_ID:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
