@@ -20,6 +20,12 @@ struct Step: Identifiable {
     var done = false
 }
 
+struct DiscoveredProject: Identifiable, Hashable {
+    let id: String      // path
+    let name: String
+    let path: String
+}
+
 final class Runner: ObservableObject {
     static let scriptPath = ProcessInfo.processInfo.environment["C2S_SCRIPT"]
         ?? FileManager.default.currentDirectoryPath + "/chrome-to-safari.sh"
@@ -102,8 +108,9 @@ struct ContentView: View {
     @State private var appName = ""
     @State private var bundleID = ""
     @State private var teamID = ""
-    @State private var outDir = ""
     @State private var mode: ConversionMode = .convert
+    @AppStorage("c2sScanRoot") private var scanRoot = ""
+    @State private var discovered: [DiscoveredProject] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -115,8 +122,12 @@ struct ContentView: View {
             .pickerStyle(.segmented)
             .disabled(runner.running)
 
+            workspaceRow
+
             if mode != .installOnly {
                 dropZone
+            } else {
+                discovery
             }
 
             VStack(spacing: 12) {
@@ -159,16 +170,6 @@ struct ContentView: View {
                     optionRow("App Name", "from the extension's manifest", $appName)
                     optionRow("Bundle ID", "com.converted.<name>", $bundleID)
                     optionRow("Team ID", "auto-detected from your keychain", $teamID)
-                    GridRow {
-                        Text("Output Folder")
-                            .gridColumnAlignment(.trailing)
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 6) {
-                            TextField("next to the extension", text: $outDir)
-                                .textFieldStyle(.roundedBorder)
-                            Button("…", action: chooseOutDir)
-                        }
-                    }
                 }
                 .font(.callout)
                 .disabled(runner.running)
@@ -271,6 +272,81 @@ struct ContentView: View {
         .animation(.easeOut(duration: 0.15), value: dropTargeted)
     }
 
+    private var workspaceRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text("Converted Projects Folder")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if mode == .installOnly {
+                    Button("Scan") { refreshDiscoveries() }
+                }
+                Button("…") { chooseScanRoot() }
+            }
+            .font(.callout)
+
+            HStack(spacing: 6) {
+                TextField("where your converted projects live", text: $scanRoot)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(runner.running)
+            }
+            .font(.callout)
+
+            if mode != .installOnly {
+                Text("Build Only writes each extension into <this folder>/project/.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var discovery: some View {
+        Group {
+            if discovered.isEmpty {
+                Text("No converted projects found here. Set the folder above, or type an output folder path below.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(spacing: 2) {
+                        ForEach(discovered) { p in
+                            Button {
+                                input = p.path
+                            } label: {
+                                HStack {
+                                    Image(systemName: "square.stack.3d.up.fill")
+                                        .foregroundStyle(.secondary)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(p.name)
+                                            .font(.callout.weight(.medium))
+                                        Text(p.path)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                    Spacer()
+                                    if input == p.path {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(Color.accentColor)
+                                    }
+                                }
+                                .padding(6)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .background(input == p.path ? Color.accentColor.opacity(0.12) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 6))
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+            }
+        }
+        .onAppear { refreshDiscoveries() }
+        .onChange(of: scanRoot) { refreshDiscoveries() }
+    }
+
     private var resultBanner: some View {
         let ok = runner.succeeded
         return HStack(spacing: 10) {
@@ -317,8 +393,13 @@ struct ContentView: View {
     private func convert() {
         let value = input.trimmingCharacters(in: .whitespaces)
         guard !value.isEmpty, !runner.running else { return }
-        var env = ["APP_NAME": appName, "BUNDLE_ID": bundleID, "TEAM_ID": teamID, "OUT_DIR": outDir]
-        if mode == .installOnly {
+        var env = ["APP_NAME": appName, "BUNDLE_ID": bundleID, "TEAM_ID": teamID]
+        switch mode {
+        case .convert, .buildOnly:
+            if !scanRoot.isEmpty {
+                env["OUT_DIR"] = scanRoot
+            }
+        case .installOnly:
             env["OUT_DIR"] = value
         }
         runner.run(input: value, env: env, mode: mode)
@@ -334,15 +415,63 @@ struct ContentView: View {
         }
     }
 
-    private func chooseOutDir() {
+    private func chooseScanRoot() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.message = "Pick where the build output should go"
+        panel.message = "Pick the folder that contains your converted projects"
         if panel.runModal() == .OK, let url = panel.url {
-            outDir = url.path
+            scanRoot = url.path
         }
+    }
+
+    // Find every converted app under a folder. Primary layout is a shared
+    // workspace: <dir>/project/<App>/<App>.xcodeproj. Falle back to a single-app
+    // output folder (<dir>/<App>/<App>.xcodeproj) for legacy setups.
+    private func appProjects(in dir: String) -> [URL] {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: dir)
+        let projectRoot = root.appendingPathComponent("project")
+        if let apps = try? fm.contentsOfDirectory(atPath: projectRoot.path) {
+            let found = apps.compactMap { app -> URL? in
+                let proj = projectRoot.appendingPathComponent("\(app)/\(app).xcodeproj")
+                return fm.fileExists(atPath: proj.path) ? proj : nil
+            }
+            if !found.isEmpty { return found }
+        }
+        if let apps = try? fm.contentsOfDirectory(atPath: dir) {
+            let found = apps.filter { !$0.hasSuffix(".xcodeproj") }.compactMap { app -> URL? in
+                let proj = root.appendingPathComponent("\(app)/\(app).xcodeproj")
+                return fm.fileExists(atPath: proj.path) ? proj : nil
+            }
+            if !found.isEmpty { return found }
+        }
+        return []
+    }
+
+    private func refreshDiscoveries() {
+        discovered = []
+        guard !scanRoot.isEmpty else { return }
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: scanRoot)
+        var roots = [root]
+        if let entries = try? fm.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]) {
+            roots.append(contentsOf: entries.filter { $0.hasDirectoryPath })
+        }
+        var seen = Set<String>()
+        var items: [DiscoveredProject] = []
+        for candidate in roots {
+            for proj in appProjects(in: candidate.path) {
+                let appDir = proj.deletingLastPathComponent().path
+                guard seen.insert(appDir).inserted else { continue }
+                let name = proj.deletingLastPathComponent().lastPathComponent
+                items.append(DiscoveredProject(id: appDir, name: name, path: appDir))
+            }
+        }
+        items.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        discovered = items
     }
 
     private func chooseFolder() {

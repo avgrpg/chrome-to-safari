@@ -45,24 +45,55 @@ Prefer the terminal? Point the script straight at a folder or a store link:
 
 Each run converts the extension, builds the wrapper app, signs it, installs it to `/Applications`, and opens Safari.
 
-### Edit and reinstall workflow
+### Add an extension, then edit and reinstall
 
-If you want to edit the converted extension before installing:
+Use one **converted projects folder** (a "workspace") to hold every extension you convert. Each `--build-only` run drops a new app into `<workspace>/project/`:
 
 ```bash
-# Step 1: Convert + build only (keeps the Xcode project)
-./chrome-to-safari.sh /path/to/extension --build-only
+# Step 1 (once): pick a workspace and convert + build an extension
+OUT_DIR=/path/to/workspace ./chrome-to-safari.sh /path/to/extension --build-only
 
 # Step 2: Edit the extension source in the generated Xcode project
-#   The converted files are in: <output-dir>/<app-name>/
+#   The converted files are in: <workspace>/project/<app-name>/
 
-# Step 3: Rebuild + install from the existing project
-OUT_DIR=/path/to/output-folder ./chrome-to-safari.sh --install-only
+# Step 3: Rebuild + install just that app from the existing project
+./chrome-to-safari.sh --install-only /path/to/workspace --app "<app-name>"
 ```
 
-You can repeat step 2 and 3 as many times as you like — just edit the source and re-run `--install-only`.
+Repeat step 2 and 3 as many times as you like — edit the source and re-run `--install-only`. Convert another extension (same `OUT_DIR`) and it lands in the same `<workspace>/project/`, so one folder holds all of them.
 
-This also works in the UI — use the **Build Only** mode first, edit the extension in Xcode, then switch to **Install Only** and paste the same output folder path. The folder name itself does not matter; it must contain the converted project's `.xcodeproj` folder.
+The workspace has this layout. `project/` is the source you edit and commit; `build/` is generated DerivedData that's never committed (the tool writes a `.gitignore` for you):
+
+```
+<workspace>/
+├── .gitignore        # generated: ignores build/ and junk
+├── project/          # ← converted source: one folder per app, commit this
+│   ├── <app-a>/<app-a>.xcodeproj/
+│   └── <app-b>/<app-b>.xcodeproj/
+└── build/<slug>/     # per-app DerivedData — generated, never committed
+```
+
+In the UI this is driven by the single **Converted Projects Folder** field, shared by both modes: **Build Only** writes each extension into `<workspace>/project/`, and **Install Only** auto-scans that folder and lists every converted app — just click one to install (or use `--app "<name>"` on the command line if the folder holds several).
+
+### Sync the converted project between machines (git)
+
+Because signing is per-machine (each Mac must sign its own build with its own free Apple Development certificate), the right way to move converted extensions between Macs is to share the **workspace source** and build on each machine:
+
+```bash
+# --- Machine A (edit + publish) ---
+OUT_DIR=/path/to/workspace ./chrome-to-safari.sh /path/to/extension --build-only
+cd /path/to/workspace
+git init && git add . && git commit -m "Safari extensions"   # build/ is already ignored
+git remote add origin <your-repo-url> && git push -u origin main
+
+# later: edit source under project/, add more apps, re-commit, re-push as usual
+
+# --- Machine B (consume + install) ---
+git clone <your-repo-url> /path/to/workspace
+./chrome-to-safari.sh --install-only /path/to/workspace --app "<app-name>"
+```
+
+`--install-only` rebuilds from the committed `project/` source and signs it locally — no built code ever needs to be in git, and the working tree stays clean after install (DerivedData is built to a temp folder and removed). If the workspace holds several apps and you don't pass `--app`, the script prints the list of apps to choose from.
 
 ## Requirements
 
@@ -78,7 +109,7 @@ These match the **Options** section in the app. All optional.
 | `APP_NAME`  | `"name"` field from `manifest.json`  | Display name of the wrapper app  |
 | `BUNDLE_ID` | `com.converted.<slug>`               | Bundle identifier                |
 | `TEAM_ID`   | auto-detected from your keychain     | Apple team ID (if you have several certificates) |
-| `OUT_DIR`   | `<extension-parent>/<slug>-safari`   | Where the Xcode project and build output go |
+| `OUT_DIR`   | `<extension-parent>/<slug>-safari`   | Where the converted source (`project/`) and build output (`build/`) go |
 
 Example:
 
@@ -90,12 +121,12 @@ APP_NAME="My Cool Extension" BUNDLE_ID=com.me.coolext ./chrome-to-safari.sh ./my
 
 1. **Downloads the extension first, if you gave it a store link.** It pulls the `.crx` from Google's own update endpoint (the same one Chrome uses), unpacks it, and strips the store's `_metadata` folder. Note: fetching a `.crx` outside Chrome is technically against the Web Store terms — fine for converting an extension for your own use, but know that's what's happening.
 2. **Reads `manifest.json`** to name the app (handles `__MSG_*__` i18n placeholders by falling back to the folder name).
-3. **Converts** with Apple's `xcrun safari-web-extension-converter`, copying your extension's resources into a fresh Xcode project.
+3. **Converts** with Apple's `xcrun safari-web-extension-converter`, copying your extension's resources into a fresh Xcode project under `<OUT_DIR>/project/`.
 4. **Fixes a converter quirk**: the generated app and extension targets can end up with mismatched bundle identifiers, which breaks the build with *"Embedded binary's bundle identifier is not prefixed with the parent app's bundle identifier"*. The script normalizes the extension ID to `<app ID>.Extension`.
 5. **Builds** with `xcodebuild`, injecting your team ID so both targets are signed with your free Apple Development certificate.
 6. **Verifies** the code signature.
 7. **Installs** the app to `/Applications`, registers it with Launch Services, and launches it plus Safari.
-8. **Cleans up after itself**: once the app is in `/Applications`, the generated Xcode project and build tree are deleted so you don't end up with duplicate copies of the extension. Pass `--build-only` if you want to keep them.
+8. **Cleans up after itself**: once the app is in `/Applications`, the generated Xcode project and build tree are deleted so you don't end up with duplicate copies of the extension. Pass `--build-only` if you want to keep them (the `project/` source plus a `.gitignore`, ready to commit).
 
 Re-running the script is safe: it re-converts and rebuilds from scratch each time, so just run it again after changing your extension's source.
 

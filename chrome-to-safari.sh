@@ -5,11 +5,10 @@ set -euo pipefail
 # installed Safari extension. No paid Apple Developer ID needed.
 #
 # Usage:
-#   ./chrome-to-safari.sh /path/to/extension              # convert + build + install + launch
-#   ./chrome-to-safari.sh <chrome-web-store-url>          # download from the store, then same
-#   ./chrome-to-safari.sh /path/to/extension --build-only # convert + build, don't install
-#   OUT_DIR=/path/to/ext-safari ./chrome-to-safari.sh --install-only  # rebuild + install from existing project
-#   ./chrome-to-safari.sh --ui                            # open the native app UI
+#   ./chrome-to-safari.sh /path/to/extension [--build-only]  # convert + build (+ install + launch)
+#   ./chrome-to-safari.sh <chrome-web-store-url> [--build-only]
+#   ./chrome-to-safari.sh --install-only [/path/to/output-folder]  # rebuild + install from an existing project
+#   ./chrome-to-safari.sh --ui                                  # open the native app UI
 #
 # Env overrides (all optional):
 #   APP_NAME    display name        (default: "name" from manifest.json)
@@ -33,25 +32,56 @@ fi
 
 # --- Install-only mode: rebuild + install from an existing converted project ---
 if [ "${1:-}" = "--install-only" ]; then
-  if [ -z "${OUT_DIR:-}" ]; then
-    echo "ERROR: --install-only requires OUT_DIR to point to the converted project directory." >&2
-    echo "  Example: OUT_DIR=/path/to/ext-safari ./chrome-to-safari.sh --install-only" >&2
+  # Accept a positional path or the legacy OUT_DIR env var, plus an optional
+  # app selector (3rd positional or C2S_APP) when the folder holds several apps.
+  INPUT_DIR="${2:-${OUT_DIR:-}}"
+  if [ "${3:-}" = "--app" ]; then
+    APP_SELECT="${4:-}"
+  else
+    APP_SELECT="${3:-${C2S_APP:-}}"
+  fi
+  if [ -z "$INPUT_DIR" ]; then
+    echo "ERROR: --install-only needs the converted project directory." >&2
+    echo "  Example: ./chrome-to-safari.sh --install-only /path/to/workspace --app \"My Extension\"" >&2
+    echo "       or: OUT_DIR=/path/to/workspace ./chrome-to-safari.sh --install-only" >&2
     exit 1
+  fi
+  if [ -d "$INPUT_DIR" ]; then
+    INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
   fi
 
   # The output directory can have any name. Find the project generated inside it
   # instead of assuming its name is derived from the output folder name.
+  # Current layout: <dir>/project/<App>/<App>.xcodeproj
+  # Legacy layout:  <dir>/<App>/<App>.xcodeproj   or  <App dir itself>
   shopt -s nullglob
-  PROJECTS=("$OUT_DIR"/*/*.xcodeproj)
+  PROJECTS=("$INPUT_DIR"/project/*/*.xcodeproj "$INPUT_DIR"/*/*.xcodeproj "$INPUT_DIR"/*.xcodeproj)
   shopt -u nullglob
   if [ "${#PROJECTS[@]}" -eq 0 ]; then
-    echo "ERROR: No Xcode project found inside $OUT_DIR" >&2
+    echo "ERROR: No Xcode project found inside $INPUT_DIR" >&2
     echo "  Select the output folder created by --build-only, not its build subfolder." >&2
     exit 1
   fi
+  if [ "${#PROJECTS[@]}" -gt 1 ] && [ -n "$APP_SELECT" ]; then
+    # Filter to the requested app; keep the ones whose app folder matches.
+    KEPT=()
+    for P in "${PROJECTS[@]}"; do
+      if [ "$(basename "$(dirname "$P")")" = "$APP_SELECT" ]; then
+        KEPT+=("$P")
+      fi
+    done
+    if [ "${#KEPT[@]}" -gt 0 ]; then
+      PROJECTS=("${KEPT[@]}")
+    fi
+  fi
   if [ "${#PROJECTS[@]}" -gt 1 ]; then
-    echo "ERROR: Multiple Xcode projects found inside $OUT_DIR" >&2
-    echo "  Select an output folder containing only one converted project." >&2
+    echo "ERROR: Several converted apps found inside $INPUT_DIR." >&2
+    for P in "${PROJECTS[@]}"; do
+      echo "  - $(basename "$(dirname "$P")")   ($(dirname "$P"))" >&2
+    done
+    echo "Pick one with --app \"<name>\" or point directly at its folder:" >&2
+    echo "  ./chrome-to-safari.sh --install-only $INPUT_DIR --app \"<name>\"" >&2
+    echo "  ./chrome-to-safari.sh --install-only \"$INPUT_DIR/project/<name>\"" >&2
     exit 1
   fi
   PROJECT="${PROJECTS[0]}"
@@ -68,19 +98,22 @@ if [ "${1:-}" = "--install-only" ]; then
   echo "==> App name:  $APP_NAME"
   echo "==> Team ID:   $TEAM_ID"
 
+  # Build into a temp DerivedData dir so the git-tracked source tree stays clean.
+  BUILD_DIR="$(mktemp -d)"
+  trap 'rm -rf "$BUILD_DIR"' EXIT
+
   echo "==> Building..."
-  rm -rf "$OUT_DIR/build/Build/Products"
   xcodebuild \
     -project "$PROJECT" \
     -scheme "$APP_NAME" \
     -configuration Release \
-    -derivedDataPath "$OUT_DIR/build" \
+    -derivedDataPath "$BUILD_DIR" \
     -allowProvisioningUpdates \
     DEVELOPMENT_TEAM="$TEAM_ID" \
     CODE_SIGN_STYLE=Automatic \
     build 2>&1 | grep -E "BUILD|error|Cycle"
 
-  APP="$OUT_DIR/build/Build/Products/Release/$APP_NAME.app"
+  APP="$BUILD_DIR/Build/Products/Release/$APP_NAME.app"
   if [ ! -d "$APP" ]; then
     echo "ERROR: build product not found at $APP" >&2
     exit 1
@@ -153,6 +186,7 @@ fi
 SLUG="$(printf '%s' "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//')"
 BUNDLE_ID="${BUNDLE_ID:-com.converted.$SLUG}"
 OUT_DIR="${OUT_DIR:-${OUT_BASE:-$(dirname "$EXT_DIR")}/$SLUG-safari}"
+BUILD_SUB="$OUT_DIR/build/$SLUG"
 
 echo "==> App name:  $APP_NAME"
 echo "==> Bundle ID: $BUNDLE_ID"
@@ -183,17 +217,26 @@ echo "==> Team ID:   $TEAM_ID"
 
 # --- Convert ------------------------------------------------------------------
 echo "==> Converting with safari-web-extension-converter..."
+mkdir -p "$OUT_DIR/project"
 xcrun safari-web-extension-converter "$EXT_DIR" \
-  --project-location "$OUT_DIR" \
+  --project-location "$OUT_DIR/project" \
   --app-name "$APP_NAME" \
   --bundle-identifier "$BUNDLE_ID" \
   --macos-only --copy-resources --no-open --no-prompt --force
 
-PROJECT="$OUT_DIR/$APP_NAME/$APP_NAME.xcodeproj"
+PROJECT="$OUT_DIR/project/$APP_NAME/$APP_NAME.xcodeproj"
 if [ ! -d "$PROJECT" ]; then
   echo "ERROR: converter did not produce $PROJECT" >&2
   exit 1
 fi
+
+# Make the output folder git-ready: the converted source (project/) is meant to be
+# committed, the generated build tree and junk never is.
+cat > "$OUT_DIR/.gitignore" <<'EOF'
+build/
+**/.DS_Store
+**/xcuserdata/
+EOF
 
 # The converter sometimes derives the app's bundle ID from the app name while
 # giving the extension the ID passed via --bundle-identifier. If they differ
@@ -207,18 +250,18 @@ sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = \"\{0,1\}[^\";]*\.Extension\"\{0,1\};/P
 
 # --- Build --------------------------------------------------------------------
 echo "==> Building..."
-rm -rf "$OUT_DIR/build/Build/Products"   # no stale products from failed runs
+rm -rf "$BUILD_SUB/Build/Products"   # no stale products from failed runs
 xcodebuild \
   -project "$PROJECT" \
   -scheme "$APP_NAME" \
   -configuration Release \
-  -derivedDataPath "$OUT_DIR/build" \
+  -derivedDataPath "$BUILD_SUB" \
   -allowProvisioningUpdates \
   DEVELOPMENT_TEAM="$TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
   build 2>&1 | grep -E "BUILD|error|Cycle"
 
-APP="$OUT_DIR/build/Build/Products/Release/$APP_NAME.app"
+APP="$BUILD_SUB/Build/Products/Release/$APP_NAME.app"
 if [ ! -d "$APP" ]; then
   echo "ERROR: build product not found at $APP" >&2
   exit 1
@@ -229,7 +272,11 @@ codesign --verify --deep --strict "$APP"
 
 if [ "$BUILD_ONLY" = "--build-only" ]; then
   echo ""
-  echo "Done (build only). App at: $APP"
+  echo "Done (build only)."
+  echo "  Built app:   $APP"
+  echo "  Source:      $OUT_DIR/project/$APP_NAME"
+  echo "  Reinstall:   ./chrome-to-safari.sh --install-only $OUT_DIR --app \"$APP_NAME\""
+  echo "  (The output folder is git-ready: commit project/, build/ is ignored.)"
   exit 0
 fi
 
@@ -249,8 +296,8 @@ open -a Safari
 # Once the app is in /Applications they're dead weight; a re-run regenerates
 # everything from scratch anyway. Use --build-only if you want to keep them.
 # Only remove the two directories this script created, never OUT_DIR wholesale.
-rm -rf "$OUT_DIR/$APP_NAME" "$OUT_DIR/build"
-rmdir "$OUT_DIR" 2>/dev/null || true
+rm -rf "$OUT_DIR/project/$APP_NAME" "$BUILD_SUB"
+rmdir "$OUT_DIR/project" "$OUT_DIR" 2>/dev/null || true
 
 echo ""
 echo "Done. Enable it in Safari > Settings > Extensions."
