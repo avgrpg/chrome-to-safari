@@ -41,6 +41,9 @@ Prefer the terminal? Point the script straight at a folder or a store link:
 
 # Convert and build, but don't install to /Applications
 ./chrome-to-safari.sh /path/to/extension --build-only
+
+# Rebuild + install from a saved converted project (see "Edit and reinstall" below)
+./chrome-to-safari.sh --from-source /path/to/converted-project
 ```
 
 Each run converts the extension, builds the wrapper app, signs it, installs it to `/Applications`, and opens Safari.
@@ -63,6 +66,20 @@ OUT_DIR=/path/to/output-folder ./chrome-to-safari.sh --install-only
 You can repeat step 2 and 3 as many times as you like — just edit the source and re-run `--install-only`.
 
 This also works in the UI — use the **Build Only** mode first, edit the extension in Xcode, then switch to **Install Only** and paste the same output folder path. The folder name itself does not matter; it must contain the converted project's `.xcodeproj` folder.
+
+### Reinstall from a synced project folder
+
+The converted project's `build/` folder is large, so you might not sync it to git — only the converted source. If the build tree is gone, `--install-only`'s sibling `--from-source` mode rebuilds it from the project source you kept:
+
+```bash
+# Point it at the output folder... 
+./chrome-to-safari.sh --from-source /path/to/output-folder
+
+# ...or straight at the project folder itself (the one with the .xcodeproj)
+./chrome-to-safari.sh --from-source /path/to/output-folder/<app-name>
+```
+
+Both forms regenerate `build/` next to the project, sign the app, and install it. This is the mode to use when you've synced the extracted source (for example an `extension/` folder in git) without the bulky build output.
 
 ## Requirements
 

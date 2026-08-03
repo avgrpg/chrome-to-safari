@@ -9,6 +9,7 @@ set -euo pipefail
 #   ./chrome-to-safari.sh <chrome-web-store-url>          # download from the store, then same
 #   ./chrome-to-safari.sh /path/to/extension --build-only # convert + build, don't install
 #   OUT_DIR=/path/to/ext-safari ./chrome-to-safari.sh --install-only  # rebuild + install from existing project
+#   ./chrome-to-safari.sh --from-source /path/to/project   # rebuild + install from a saved project folder
 #   ./chrome-to-safari.sh --ui                            # open the native app UI
 #
 # Env overrides (all optional):
@@ -31,81 +32,156 @@ if [ "${1:-}" = "--ui" ]; then
   exec env C2S_SCRIPT="$SCRIPT_DIR/chrome-to-safari.sh" "$UI_BIN"
 fi
 
+# --- Shared helpers -------------------------------------------------------------
+
+# Locate the single converted Xcode project under $1. Accepts either the output
+# folder (project nested one level: <dir>/<app>/<app>.xcodeproj) or the app
+# folder itself (<dir>/<app>.xcodeproj). Sets $PROJECT.
+find_project() {
+  local dir="$1" direct nested
+  shopt -s nullglob
+  direct=("$dir"/*.xcodeproj)
+  nested=("$dir"/*/*.xcodeproj)
+  shopt -u nullglob
+  if [ "${#direct[@]}" -eq 1 ]; then
+    PROJECT="${direct[0]}"
+  elif [ "${#nested[@]}" -eq 1 ]; then
+    PROJECT="${nested[0]}"
+  else
+    echo "ERROR: expected one converted Xcode project in $dir" >&2
+    echo "  Found ${#direct[@]} project(s) directly and ${#nested[@]} nested project(s)." >&2
+    echo "  Point this mode at the output folder from --build-only, or at the project folder itself." >&2
+    return 1
+  fi
+}
+
+# Detect an Apple Development team ID from the keychain; override with TEAM_ID.
+# Never fails the script when no certificate is found — callers check TEAM_ID.
+detect_team_id() {
+  if [ -z "${TEAM_ID:-}" ]; then
+    TEAM_ID="$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+      | openssl x509 -noout -subject 2>/dev/null \
+      | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p')" || TEAM_ID=""
+  fi
+}
+
+# Print the one-time Apple Development certificate setup instructions.
+print_cert_help() {
+  cat >&2 <<'EOF'
+ERROR: No Apple Development certificate found.
+
+One-time setup (free, no paid developer account needed):
+  1. Open Xcode > Settings > Accounts
+  2. Click "+" and sign in with your Apple ID
+  3. Select your account > "Manage Certificates..." > "+" > "Apple Development"
+  4. Re-run this script
+
+Without this, Safari treats the extension as unsigned and disables it
+on every restart.
+EOF
+}
+
+# Detect the team ID, or print setup help and exit if none is available.
+require_team_id() {
+  detect_team_id
+  if [ -z "$TEAM_ID" ]; then
+    print_cert_help
+    exit 1
+  fi
+}
+
+# Build a converted project, verify its signature, and (unless --skip-install)
+# install it to /Applications and launch Safari.
+build_install_project() {
+  local project="$1" app_name="$2" root="$3" skip="${4:-}"
+  local app
+
+  echo "==> Building..."
+  rm -rf "$root/build/Build/Products"   # no stale products from failed runs
+  xcodebuild \
+    -project "$project" \
+    -scheme "$app_name" \
+    -configuration Release \
+    -derivedDataPath "$root/build" \
+    -allowProvisioningUpdates \
+    DEVELOPMENT_TEAM="$TEAM_ID" \
+    CODE_SIGN_STYLE=Automatic \
+    build 2>&1 | grep -E "BUILD|error|Cycle"
+
+  app="$root/build/Build/Products/Release/$app_name.app"
+  if [ ! -d "$app" ]; then
+    echo "ERROR: build product not found at $app" >&2
+    exit 1
+  fi
+
+  echo "==> Verifying signature..."
+  codesign --verify --deep --strict "$app"
+
+  if [ "$skip" = "--skip-install" ]; then
+    echo ""
+    echo "Done (build only). App at: $app"
+    return 0
+  fi
+
+  echo "==> Installing to /Applications..."
+  rm -rf "/Applications/$app_name.app"
+  mv "$app" /Applications/
+
+  /System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister \
+    -f -R -trusted "/Applications/$app_name.app"
+
+  open -a "/Applications/$app_name.app"
+  sleep 2
+  open -a Safari
+
+  echo ""
+  echo "Done. Enable it in Safari > Settings > Extensions."
+}
+
 # --- Install-only mode: rebuild + install from an existing converted project ---
+# Requires OUT_DIR. The project's build/ tree may be absent; it is regenerated.
 if [ "${1:-}" = "--install-only" ]; then
   if [ -z "${OUT_DIR:-}" ]; then
     echo "ERROR: --install-only requires OUT_DIR to point to the converted project directory." >&2
     echo "  Example: OUT_DIR=/path/to/ext-safari ./chrome-to-safari.sh --install-only" >&2
     exit 1
   fi
+  OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
-  # The output directory can have any name. Find the project generated inside it
-  # instead of assuming its name is derived from the output folder name.
-  shopt -s nullglob
-  PROJECTS=("$OUT_DIR"/*/*.xcodeproj)
-  shopt -u nullglob
-  if [ "${#PROJECTS[@]}" -eq 0 ]; then
-    echo "ERROR: No Xcode project found inside $OUT_DIR" >&2
-    echo "  Select the output folder created by --build-only, not its build subfolder." >&2
-    exit 1
-  fi
-  if [ "${#PROJECTS[@]}" -gt 1 ]; then
-    echo "ERROR: Multiple Xcode projects found inside $OUT_DIR" >&2
-    echo "  Select an output folder containing only one converted project." >&2
-    exit 1
-  fi
-  PROJECT="${PROJECTS[0]}"
+  find_project "$OUT_DIR"
   APP_NAME="$(basename "$PROJECT" .xcodeproj)"
 
-  # Signing identity
-  TEAM_ID="${TEAM_ID:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
-    | openssl x509 -noout -subject 2>/dev/null \
-    | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p')}"
-  if [ -z "$TEAM_ID" ]; then
-    echo "ERROR: No Apple Development certificate found." >&2
-    exit 1
-  fi
+  require_team_id
   echo "==> App name:  $APP_NAME"
   echo "==> Team ID:   $TEAM_ID"
 
-  echo "==> Building..."
-  rm -rf "$OUT_DIR/build/Build/Products"
-  xcodebuild \
-    -project "$PROJECT" \
-    -scheme "$APP_NAME" \
-    -configuration Release \
-    -derivedDataPath "$OUT_DIR/build" \
-    -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM="$TEAM_ID" \
-    CODE_SIGN_STYLE=Automatic \
-    build 2>&1 | grep -E "BUILD|error|Cycle"
-
-  APP="$OUT_DIR/build/Build/Products/Release/$APP_NAME.app"
-  if [ ! -d "$APP" ]; then
-    echo "ERROR: build product not found at $APP" >&2
-    exit 1
-  fi
-
-  echo "==> Verifying signature..."
-  codesign --verify --deep --strict "$APP"
-
-  echo "==> Installing to /Applications..."
-  rm -rf "/Applications/$APP_NAME.app"
-  mv "$APP" /Applications/
-
-  /System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister \
-    -f -R -trusted "/Applications/$APP_NAME.app"
-
-  open -a "/Applications/$APP_NAME.app"
-  sleep 2
-  open -a Safari
-
-  echo ""
-  echo "Done. Enable it in Safari > Settings > Extensions."
+  build_install_project "$PROJECT" "$APP_NAME" "$OUT_DIR"
   exit 0
 fi
 
-EXT_DIR="${1:?usage: chrome-to-safari.sh /path/to/extension|<store-url> [--build-only], or --ui}"
+# --- From-source mode: rebuild + install from a saved project folder ------------
+# e.g. the source extracted by --build-only when the large build/ tree was not
+# kept (for example, you only synced the converted project to git). The build/
+# tree is regenerated from the existing project. Accepts either the output
+# folder or the project folder itself.
+if [ "${1:-}" = "--from-source" ]; then
+  SRC="${2:?usage: chrome-to-safari.sh --from-source /path/to/converted-project}"
+  SRC="$(cd "$SRC" && pwd)"
+
+  find_project "$SRC"
+  APP_NAME="$(basename "$PROJECT" .xcodeproj)"
+  ROOT="$(dirname "$(dirname "$PROJECT")")"
+
+  require_team_id
+  echo "==> App name:  $APP_NAME"
+  echo "==> Team ID:   $TEAM_ID"
+  echo "==> Source:    $SRC"
+
+  build_install_project "$PROJECT" "$APP_NAME" "$ROOT"
+  exit 0
+fi
+
+EXT_DIR="${1:?usage: chrome-to-safari.sh /path/to/extension|<store-url> [--build-only] | --from-source /path/to/project | --ui}"
 BUILD_ONLY="${2:-}"
 
 # --- Chrome Web Store URL? Download and unpack first --------------------------
@@ -160,25 +236,7 @@ echo "==> Output:    $OUT_DIR"
 
 # --- Signing identity ---------------------------------------------------------
 # ponytail: picks first Apple Development cert; set TEAM_ID env var to override
-TEAM_ID="${TEAM_ID:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
-  | openssl x509 -noout -subject 2>/dev/null \
-  | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p')}"
-
-if [ -z "$TEAM_ID" ]; then
-  cat >&2 <<'EOF'
-ERROR: No Apple Development certificate found.
-
-One-time setup (free, no paid developer account needed):
-  1. Open Xcode > Settings > Accounts
-  2. Click "+" and sign in with your Apple ID
-  3. Select your account > "Manage Certificates..." > "+" > "Apple Development"
-  4. Re-run this script
-
-Without this, Safari treats the extension as unsigned and disables it
-on every restart.
-EOF
-  exit 1
-fi
+require_team_id
 echo "==> Team ID:   $TEAM_ID"
 
 # --- Convert ------------------------------------------------------------------
@@ -205,45 +263,13 @@ APP_ID="$(grep -o 'PRODUCT_BUNDLE_IDENTIFIER = "\{0,1\}[^";]*' "$PBX" \
   | sed 's/.*= "\{0,1\}//' | grep -v '\.Extension$' | head -1)"
 sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = \"\{0,1\}[^\";]*\.Extension\"\{0,1\};/PRODUCT_BUNDLE_IDENTIFIER = \"$APP_ID.Extension\";/g" "$PBX"
 
-# --- Build --------------------------------------------------------------------
-echo "==> Building..."
-rm -rf "$OUT_DIR/build/Build/Products"   # no stale products from failed runs
-xcodebuild \
-  -project "$PROJECT" \
-  -scheme "$APP_NAME" \
-  -configuration Release \
-  -derivedDataPath "$OUT_DIR/build" \
-  -allowProvisioningUpdates \
-  DEVELOPMENT_TEAM="$TEAM_ID" \
-  CODE_SIGN_STYLE=Automatic \
-  build 2>&1 | grep -E "BUILD|error|Cycle"
-
-APP="$OUT_DIR/build/Build/Products/Release/$APP_NAME.app"
-if [ ! -d "$APP" ]; then
-  echo "ERROR: build product not found at $APP" >&2
-  exit 1
-fi
-
-echo "==> Verifying signature..."
-codesign --verify --deep --strict "$APP"
-
+# --- Build + install ------------------------------------------------------------
 if [ "$BUILD_ONLY" = "--build-only" ]; then
-  echo ""
-  echo "Done (build only). App at: $APP"
+  build_install_project "$PROJECT" "$APP_NAME" "$OUT_DIR" --skip-install
   exit 0
 fi
 
-# --- Install + launch -----------------------------------------------------------
-echo "==> Installing to /Applications..."
-rm -rf "/Applications/$APP_NAME.app"
-mv "$APP" /Applications/
-
-/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister \
-  -f -R -trusted "/Applications/$APP_NAME.app"
-
-open -a "/Applications/$APP_NAME.app"
-sleep 2
-open -a Safari
+build_install_project "$PROJECT" "$APP_NAME" "$OUT_DIR"
 
 # The generated project and build tree hold extra copies of the extension.
 # Once the app is in /Applications they're dead weight; a re-run regenerates
@@ -251,6 +277,3 @@ open -a Safari
 # Only remove the two directories this script created, never OUT_DIR wholesale.
 rm -rf "$OUT_DIR/$APP_NAME" "$OUT_DIR/build"
 rmdir "$OUT_DIR" 2>/dev/null || true
-
-echo ""
-echo "Done. Enable it in Safari > Settings > Extensions."

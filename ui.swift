@@ -10,6 +10,7 @@ enum ConversionMode: String, CaseIterable, Identifiable {
     case convert = "Convert"
     case buildOnly = "Build Only"
     case installOnly = "Install Only"
+    case fromSource = "From Source"
 
     var id: String { rawValue }
 }
@@ -48,6 +49,8 @@ final class Runner: ObservableObject {
             proc.arguments = [Self.scriptPath, input, "--build-only"]
         case .installOnly:
             proc.arguments = [Self.scriptPath, "--install-only"]
+        case .fromSource:
+            proc.arguments = [Self.scriptPath, "--from-source", input]
         }
         var environment = ProcessInfo.processInfo.environment
         for (key, value) in env where !value.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -115,21 +118,27 @@ struct ContentView: View {
             .pickerStyle(.segmented)
             .disabled(runner.running)
 
-            if mode != .installOnly {
+            if mode != .installOnly && mode != .fromSource {
                 dropZone
             }
 
             VStack(spacing: 12) {
                 HStack(spacing: 8) {
-                    Image(systemName: mode == .installOnly ? "folder" : "link")
+                    Image(systemName: mode == .installOnly || mode == .fromSource ? "folder" : "link")
                         .foregroundStyle(.secondary)
                     TextField(mode == .installOnly
                               ? "Output folder created by Build Only"
-                              : "Store link or folder path",
+                              : mode == .fromSource
+                                ? "Converted project folder (from Build Only)"
+                                : "Store link or folder path",
                               text: $input)
                         .textFieldStyle(.roundedBorder)
                         .disabled(runner.running)
                         .onSubmit(convert)
+                    if mode == .installOnly || mode == .fromSource {
+                        Button("…", action: chooseSourceFolder)
+                            .disabled(runner.running)
+                    }
                 }
 
                 Button(action: convert) {
@@ -293,7 +302,7 @@ struct ContentView: View {
             return "Done. Enable it in Safari → Settings → Extensions."
         case .buildOnly:
             return "Done. The built app is in the output folder — see the log for the path."
-        case .installOnly:
+        case .installOnly, .fromSource:
             return "Done. Enable it in Safari → Settings → Extensions."
         }
     }
@@ -303,6 +312,7 @@ struct ContentView: View {
         case .convert:       return "Convert"
         case .buildOnly:     return "Build"
         case .installOnly:   return "Rebuild & Install"
+        case .fromSource:    return "Build & Install"
         }
     }
 
@@ -311,6 +321,7 @@ struct ContentView: View {
         case .convert:       return "Converting…"
         case .buildOnly:     return "Building…"
         case .installOnly:   return "Rebuilding…"
+        case .fromSource:    return "Building…"
         }
     }
 
@@ -350,6 +361,16 @@ struct ContentView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.message = "Pick the unpacked extension folder (the one containing manifest.json)"
+        if panel.runModal() == .OK, let url = panel.url {
+            input = url.path
+        }
+    }
+
+    private func chooseSourceFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "Pick the converted project folder (from Build Only)"
         if panel.runModal() == .OK, let url = panel.url {
             input = url.path
         }
