@@ -1,303 +1,635 @@
 #!/bin/bash
 set -euo pipefail
 
-# chrome-to-safari.sh — convert any Chrome / WebExtension into a signed,
-# installed Safari extension. No paid Apple Developer ID needed.
+# chrome-to-safari.sh — manage a personal farm of Chrome extensions converted
+# to signed, installed Safari extensions. No paid Apple Developer ID needed.
+#
+# Every extension lives in extensions/<slug>/ :
+#
+#   src/        the Chrome source. THE place to edit. For store forks it starts
+#               pristine; your changes are git commits on top of an upstream
+#               commit marked "[c2s]".
+#   safari/     optional overlay copied over src/ at build time. Use it for
+#               Safari-only files, and safari/manifest.patch.json (deep-merged
+#               into manifest.json) for Safari-only manifest keys.
+#   meta.json   identity: app name, bundle id, origin (store/local), versions.
+#   project/    GENERATED converter output — disposable, rebuilt every install,
+#               never committed, never holds edits.
 #
 # Usage:
-#   ./chrome-to-safari.sh /path/to/extension [--build-only]  # convert + build (+ install + launch)
-#   ./chrome-to-safari.sh <chrome-web-store-url> [--build-only]
-#   ./chrome-to-safari.sh --install-only [/path/to/output-folder]  # rebuild + install from an existing project
-#   ./chrome-to-safari.sh --ui                                  # open the native app UI
+#   ./chrome-to-safari.sh add <store-url | folder> [--name N] [--bundle-id B] [--no-install]
+#   ./chrome-to-safari.sh install [slug|all] [--no-launch]
+#   ./chrome-to-safari.sh update [slug|all] [--check] [--no-install]
+#   ./chrome-to-safari.sh list
+#   ./chrome-to-safari.sh ui
 #
-# Env overrides (all optional):
-#   APP_NAME    display name        (default: "name" from manifest.json)
-#   BUNDLE_ID   bundle identifier   (default: com.converted.<slug>)
-#   TEAM_ID     Apple team ID       (default: auto-detected from your keychain)
-#   OUT_DIR     output directory    (default: ./<slug>-safari next to the extension)
+# Typing an old-style source (path or URL) without a verb is shorthand for `add`.
+# Env overrides: TEAM_ID (signing team), C2S_EXTENSIONS (extensions directory).
 
-# --- Native UI ----------------------------------------------------------------
-# compiled from ui.swift on the user's own machine, so Gatekeeper never sees it
-if [ "${1:-}" = "--ui" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  UI_SRC="$SCRIPT_DIR/ui.swift"
-  UI_BIN="$SCRIPT_DIR/.ui/ChromeToSafari"
-  if [ ! -x "$UI_BIN" ] || [ "$UI_SRC" -nt "$UI_BIN" ]; then
-    echo "==> Compiling the UI (first run only)..."
-    mkdir -p "$SCRIPT_DIR/.ui"
-    swiftc -O -parse-as-library "$UI_SRC" -o "$UI_BIN"
-  fi
-  exec env C2S_SCRIPT="$SCRIPT_DIR/chrome-to-safari.sh" "$UI_BIN"
-fi
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="$REPO_ROOT/chrome-to-safari.sh"
+EXTENSIONS_DIR="${C2S_EXTENSIONS:-$REPO_ROOT/extensions}"
 
-# --- Install-only mode: rebuild + install from an existing converted project ---
-if [ "${1:-}" = "--install-only" ]; then
-  # Accept a positional path or the legacy OUT_DIR env var, plus an optional
-  # app selector (3rd positional or C2S_APP) when the folder holds several apps.
-  INPUT_DIR="${2:-${OUT_DIR:-}}"
-  if [ "${3:-}" = "--app" ]; then
-    APP_SELECT="${4:-}"
-  else
-    APP_SELECT="${3:-${C2S_APP:-}}"
-  fi
-  if [ -z "$INPUT_DIR" ]; then
-    echo "ERROR: --install-only needs the converted project directory." >&2
-    echo "  Example: ./chrome-to-safari.sh --install-only /path/to/workspace --app \"My Extension\"" >&2
-    echo "       or: OUT_DIR=/path/to/workspace ./chrome-to-safari.sh --install-only" >&2
-    exit 1
-  fi
-  if [ -d "$INPUT_DIR" ]; then
-    INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
-  fi
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
 
-  # The output directory can have any name. Find the project generated inside it
-  # instead of assuming its name is derived from the output folder name.
-  # Current layout: <dir>/project/<App>/<App>.xcodeproj
-  # Legacy layout:  <dir>/<App>/<App>.xcodeproj   or  <App dir itself>
-  shopt -s nullglob
-  PROJECTS=("$INPUT_DIR"/project/*/*.xcodeproj "$INPUT_DIR"/*/*.xcodeproj "$INPUT_DIR"/*.xcodeproj)
-  shopt -u nullglob
-  if [ "${#PROJECTS[@]}" -eq 0 ]; then
-    echo "ERROR: No Xcode project found inside $INPUT_DIR" >&2
-    echo "  Select the output folder created by --build-only, not its build subfolder." >&2
-    exit 1
-  fi
-  if [ "${#PROJECTS[@]}" -gt 1 ] && [ -n "$APP_SELECT" ]; then
-    # Filter to the requested app; keep the ones whose app folder matches.
-    KEPT=()
-    for P in "${PROJECTS[@]}"; do
-      if [ "$(basename "$(dirname "$P")")" = "$APP_SELECT" ]; then
-        KEPT+=("$P")
-      fi
-    done
-    if [ "${#KEPT[@]}" -gt 0 ]; then
-      PROJECTS=("${KEPT[@]}")
-    fi
-  fi
-  if [ "${#PROJECTS[@]}" -gt 1 ]; then
-    echo "ERROR: Several converted apps found inside $INPUT_DIR." >&2
-    for P in "${PROJECTS[@]}"; do
-      echo "  - $(basename "$(dirname "$P")")   ($(dirname "$P"))" >&2
-    done
-    echo "Pick one with --app \"<name>\" or point directly at its folder:" >&2
-    echo "  ./chrome-to-safari.sh --install-only $INPUT_DIR --app \"<name>\"" >&2
-    echo "  ./chrome-to-safari.sh --install-only \"$INPUT_DIR/project/<name>\"" >&2
-    exit 1
-  fi
-  PROJECT="${PROJECTS[0]}"
-  APP_NAME="$(basename "$PROJECT" .xcodeproj)"
+# --- helpers -------------------------------------------------------------------
 
-  # Signing identity
-  TEAM_ID="${TEAM_ID:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+die()      { echo "ERROR: $*" >&2; exit 1; }
+info()     { echo "==> $*"; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+usage() { sed -n '2,27p' "$0"; }
+
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//'
+}
+
+json_field() { # file, key -> value ("" when absent)
+  python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+v=d.get(sys.argv[2],"")
+print("" if v is None else v)' "$1" "$2"
+}
+
+manifest_field() { # manifest.json, key -> value
+  python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(d.get(sys.argv[2],""))' "$1" "$2"
+}
+
+manifest_name() { # manifest.json -> display name, resolving __MSG_key__ via _locales
+  python3 -c 'import json,sys,re,os
+
+m = json.load(open(sys.argv[1]))
+name = m.get("name", "")
+match = re.match(r"^__MSG_(.+)__$", name or "")
+if not match:
+    print(name); raise SystemExit
+key = match.group(1)
+locales_dir = sys.argv[2]
+order = [m.get("default_locale", ""), "en"]
+for cand in order:
+    if not cand:
+        continue
+    messages_path = os.path.join(locales_dir, cand, "messages.json")
+    if not os.path.exists(messages_path):
+        continue
+    with open(messages_path) as f:
+        messages = json.load(f)
+    for k, v in messages.items():
+        if k.lower() == key.lower() and isinstance(v, dict):
+            print(v.get("message", "")); raise SystemExit
+print("")' "$1" "$(dirname "$1")/_locales"
+}
+
+url_slug_from_store_url() { # <store-url> -> <name> part of /detail/<name>/<id>
+  printf '%s' "$1" | sed -n 's|.*/detail/\([^/]*\)/.*|\1|p'
+}
+
+meta_set_version() { # meta.json, version
+  python3 -c 'import json,sys
+p,v=sys.argv[1],sys.argv[2]
+d=json.load(open(p))
+d["upstream_version"]=v
+with open(p,"w") as f:
+    json.dump(d,f,indent=2)
+    f.write("\n")' "$1" "$2"
+}
+
+detect_team_id() {
+  security find-certificate -c "Apple Development" -p 2>/dev/null \
     | openssl x509 -noout -subject 2>/dev/null \
-    | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p')}"
+    | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p' || true
+}
+
+require_team_id() {
+  TEAM_ID="${TEAM_ID:-$(detect_team_id)}"
   if [ -z "$TEAM_ID" ]; then
-    echo "ERROR: No Apple Development certificate found." >&2
-    exit 1
-  fi
-  echo "==> App name:  $APP_NAME"
-  echo "==> Team ID:   $TEAM_ID"
-
-  # Build into a temp DerivedData dir so the git-tracked source tree stays clean.
-  BUILD_DIR="$(mktemp -d)"
-  trap 'rm -rf "$BUILD_DIR"' EXIT
-
-  echo "==> Building..."
-  xcodebuild \
-    -project "$PROJECT" \
-    -scheme "$APP_NAME" \
-    -configuration Release \
-    -derivedDataPath "$BUILD_DIR" \
-    -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM="$TEAM_ID" \
-    CODE_SIGN_STYLE=Automatic \
-    build 2>&1 | grep -E "BUILD|error|Cycle"
-
-  APP="$BUILD_DIR/Build/Products/Release/$APP_NAME.app"
-  if [ ! -d "$APP" ]; then
-    echo "ERROR: build product not found at $APP" >&2
-    exit 1
-  fi
-
-  echo "==> Verifying signature..."
-  codesign --verify --deep --strict "$APP"
-
-  echo "==> Installing to /Applications..."
-  rm -rf "/Applications/$APP_NAME.app"
-  mv "$APP" /Applications/
-
-  /System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister \
-    -f -R -trusted "/Applications/$APP_NAME.app"
-
-  open -a "/Applications/$APP_NAME.app"
-  sleep 2
-  open -a Safari
-
-  echo ""
-  echo "Done. Enable it in Safari > Settings > Extensions."
-  exit 0
-fi
-
-EXT_DIR="${1:?usage: chrome-to-safari.sh /path/to/extension|<store-url> [--build-only], or --ui}"
-BUILD_ONLY="${2:-}"
-
-# --- Chrome Web Store URL? Download and unpack first --------------------------
-if [[ "$EXT_DIR" == http*://* ]]; then
-  # store URLs: .../detail/<slug>/<32-char-id>; IDs use letters a-p only
-  EXT_ID="$(printf '%s' "$EXT_DIR" | grep -oE '[a-p]{32}' | head -1)"
-  if [ -z "$EXT_ID" ]; then
-    echo "ERROR: no extension ID in that URL. Expected a Chrome Web Store link like" >&2
-    echo "  https://chromewebstore.google.com/detail/<name>/<32-char-id>" >&2
-    exit 1
-  fi
-  # use the URL's name slug as the folder name so APP_NAME falls back to it
-  URL_SLUG="$(printf '%s' "$EXT_DIR" | sed -n 's|.*/detail/\([^/]*\)/.*|\1|p')"
-  DL_DIR="$(mktemp -d)/${URL_SLUG:-$EXT_ID}"
-  mkdir -p "$DL_DIR"
-  echo "==> Downloading $EXT_ID from Chrome Web Store..."
-  curl -fsSL -o "$DL_DIR.crx" \
-    "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=131.0&acceptformat=crx2,crx3&x=id%3D${EXT_ID}%26uc"
-  # a .crx is a zip with a binary header; unzip skips the junk but exits nonzero
-  unzip -qo "$DL_DIR.crx" -d "$DL_DIR" 2>/dev/null || true
-  if [ ! -f "$DL_DIR/manifest.json" ]; then
-    echo "ERROR: download failed — no manifest.json in the downloaded package" >&2
-    exit 1
-  fi
-  rm -rf "$DL_DIR/_metadata"   # store signing artifacts; the converter chokes on them
-  EXT_DIR="$DL_DIR"
-  OUT_BASE="$PWD"              # don't leave build output in the temp dir
-fi
-
-EXT_DIR="$(cd "$EXT_DIR" && pwd)"
-MANIFEST="$EXT_DIR/manifest.json"
-
-if [ ! -f "$MANIFEST" ]; then
-  echo "ERROR: no manifest.json in $EXT_DIR — is this a WebExtension?" >&2
-  exit 1
-fi
-
-# --- Names ------------------------------------------------------------------
-if [ -z "${APP_NAME:-}" ]; then
-  APP_NAME="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name",""))' "$MANIFEST")"
-  # i18n manifests use "__MSG_key__" placeholders; fall back to folder name
-  case "$APP_NAME" in ""|__MSG_*) APP_NAME="$(basename "$EXT_DIR")";; esac
-fi
-
-SLUG="$(printf '%s' "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//')"
-BUNDLE_ID="${BUNDLE_ID:-com.converted.$SLUG}"
-OUT_DIR="${OUT_DIR:-${OUT_BASE:-$(dirname "$EXT_DIR")}/$SLUG-safari}"
-BUILD_SUB="$OUT_DIR/build/$SLUG"
-
-echo "==> App name:  $APP_NAME"
-echo "==> Bundle ID: $BUNDLE_ID"
-echo "==> Output:    $OUT_DIR"
-
-# --- Signing identity ---------------------------------------------------------
-# ponytail: picks first Apple Development cert; set TEAM_ID env var to override
-TEAM_ID="${TEAM_ID:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
-  | openssl x509 -noout -subject 2>/dev/null \
-  | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p')}"
-
-if [ -z "$TEAM_ID" ]; then
-  cat >&2 <<'EOF'
+    cat >&2 <<'EOF'
 ERROR: No Apple Development certificate found.
 
 One-time setup (free, no paid developer account needed):
   1. Open Xcode > Settings > Accounts
   2. Click "+" and sign in with your Apple ID
   3. Select your account > "Manage Certificates..." > "+" > "Apple Development"
-  4. Re-run this script
+  4. Re-run this command
 
 Without this, Safari treats the extension as unsigned and disables it
 on every restart.
 EOF
-  exit 1
-fi
-echo "==> Team ID:   $TEAM_ID"
+    exit 1
+  fi
+  echo "==> Team ID:   $TEAM_ID"
+}
 
-# --- Convert ------------------------------------------------------------------
-echo "==> Converting with safari-web-extension-converter..."
-mkdir -p "$OUT_DIR/project"
-xcrun safari-web-extension-converter "$EXT_DIR" \
-  --project-location "$OUT_DIR/project" \
-  --app-name "$APP_NAME" \
-  --bundle-identifier "$BUNDLE_ID" \
-  --macos-only --copy-resources --no-open --no-prompt --force
+git_run() { # act only when the farm itself is a git checkout
+  git -C "$REPO_ROOT" "$@"
+}
 
-PROJECT="$OUT_DIR/project/$APP_NAME/$APP_NAME.xcodeproj"
-if [ ! -d "$PROJECT" ]; then
-  echo "ERROR: converter did not produce $PROJECT" >&2
-  exit 1
-fi
+repo_is_git() {
+  [ -d "$REPO_ROOT/.git" ] && have_cmd git
+}
 
-# Make the output folder git-ready: the converted source (project/) is meant to be
-# committed, the generated build tree and junk never is.
-cat > "$OUT_DIR/.gitignore" <<'EOF'
-build/
-**/.DS_Store
-**/xcuserdata/
-EOF
+ext_rel_path() { # <slug> -> extension dir relative to the repo root (for git pathspecs)
+  python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+    "$EXTENSIONS_DIR/$1" "$REPO_ROOT"
+}
 
-# The converter sometimes derives the app's bundle ID from the app name while
-# giving the extension the ID passed via --bundle-identifier. If they differ
-# (even by case), the build fails with "Embedded binary's bundle identifier is
-# not prefixed with the parent app's bundle identifier". Normalize: make the
-# extension's ID always be <app ID>.Extension.
-PBX="$PROJECT/project.pbxproj"
-APP_ID="$(grep -o 'PRODUCT_BUNDLE_IDENTIFIER = "\{0,1\}[^";]*' "$PBX" \
-  | sed 's/.*= "\{0,1\}//' | grep -v '\.Extension$' | head -1)"
-sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = \"\{0,1\}[^\";]*\.Extension\"\{0,1\};/PRODUCT_BUNDLE_IDENTIFIER = \"$APP_ID.Extension\";/g" "$PBX"
+# --- Chrome Web Store downloads -------------------------------------------------
 
-# --- Build --------------------------------------------------------------------
-echo "==> Building..."
-rm -rf "$BUILD_SUB/Build/Products"   # no stale products from failed runs
-xcodebuild \
-  -project "$PROJECT" \
-  -scheme "$APP_NAME" \
-  -configuration Release \
-  -derivedDataPath "$BUILD_SUB" \
-  -allowProvisioningUpdates \
-  DEVELOPMENT_TEAM="$TEAM_ID" \
-  CODE_SIGN_STYLE=Automatic \
-  build 2>&1 | grep -E "BUILD|error|Cycle"
+store_id_from_url() { # <store-url> -> echoes 32-char id (letters a-p)
+  printf '%s' "$1" | grep -oE '[a-p]{32}' | head -1 || true
+}
 
-APP="$BUILD_SUB/Build/Products/Release/$APP_NAME.app"
-if [ ! -d "$APP" ]; then
-  echo "ERROR: build product not found at $APP" >&2
-  exit 1
-fi
+crx_fetch() { # <32-char-ext-id> -> echoes the extracted directory (chatter goes to stderr)
+  local ext_id="$1"
+  local dl_dir
+  dl_dir="$(mktemp -d)/${ext_id}"
+  mkdir -p "$dl_dir"
+  info "Downloading $ext_id from Chrome Web Store..." >&2
+  curl -fsSL -o "$dl_dir.crx" \
+    "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=140.0&acceptformat=crx2,crx3&x=id%3D${ext_id}%26uc" \
+    || die "download failed — check your network or the extension ID"
+  # a .crx is a zip with a binary header; unzip skips the junk but exits nonzero
+  unzip -qo "$dl_dir.crx" -d "$dl_dir" 2>/dev/null || true
+  [ -f "$dl_dir/manifest.json" ] || die "download failed — no manifest.json in the downloaded package"
+  rm -rf "$dl_dir/_metadata"   # store signing artifacts; the converter chokes on them
+  printf '%s' "$dl_dir"
+}
 
-echo "==> Verifying signature..."
-codesign --verify --deep --strict "$APP"
+# --- the build pipeline: sync -> convert -> build -> install --------------------
 
-if [ "$BUILD_ONLY" = "--build-only" ]; then
+sync_staging() { # <slug>, <staging-dir>: src + safari overlay merged
+  local dir="$EXTENSIONS_DIR/$1"
+  local staging="$2"
+  mkdir -p "$staging"
+  cp -R "$dir/src/." "$staging/"
+  if [ -d "$dir/safari" ]; then
+    cp -R "$dir/safari/." "$staging/" 2>/dev/null || true
+  fi
+  rm -f "$staging/.gitkeep" "$staging/manifest.patch.json"
+  local patch="$dir/safari/manifest.patch.json"
+  if [ -f "$patch" ]; then
+    info "Applying Safari manifest patch..."
+    python3 -c 'import json,sys
+
+def merge(base, extra):
+    for k, v in extra.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v)
+        else:
+            base[k] = v
+
+patch_path, manifest_path = sys.argv[1], sys.argv[2]
+with open(patch_path) as f:
+    patch = json.load(f)
+with open(manifest_path) as f:
+    manifest = json.load(f)
+merge(manifest, patch)
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")' "$patch" "$staging/manifest.json"
+  fi
+  [ -f "$staging/manifest.json" ] || die "sync produced no manifest.json — is src/ intact?"
+}
+
+normalize_bundle_ids() { # <xcodeproj>
+  # The converter sometimes derives the app's bundle ID from the app name while
+  # giving the extension the ID passed via --bundle-identifier. If they differ,
+  # the build fails with "Embedded binary's bundle identifier is not prefixed
+  # with the parent app's bundle identifier". Normalize: make the extension's
+  # ID always be <app ID>.Extension.
+  local pbx="$1/project.pbxproj"
+  local app_id
+  app_id="$(grep -o 'PRODUCT_BUNDLE_IDENTIFIER = "\{0,1\}[^";]*' "$pbx" \
+    | sed 's/.*= "\{0,1\}//' | grep -v '\.Extension$' | head -1 || true)"
+  [ -n "$app_id" ] || return 0
+  sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = \"\{0,1\}[^\";]*\.Extension\"\{0,1\};/PRODUCT_BUNDLE_IDENTIFIER = \"$app_id.Extension\";/g" "$pbx"
+}
+
+build_and_install_one() { # <slug> [--no-launch]
+  local slug="$1"
+  local no_launch="${2:-}"
+  local dir="$EXTENSIONS_DIR/$slug"
+  [ -f "$dir/meta.json" ] || die "extensions/$slug has no meta.json — not a managed extension?"
+  [ -f "$dir/src/manifest.json" ] || die "extensions/$slug/src/manifest.json missing"
+
+  local app_name bundle_id
+  app_name="$(json_field "$dir/meta.json" app_name)"
+  bundle_id="$(json_field "$dir/meta.json" bundle_id)"
+  [ -n "$app_name" ] || die "extensions/$slug/meta.json has no app_name"
+
+  require_team_id
+  echo "==> App name:  $app_name"
+  echo "==> Bundle ID: $bundle_id"
+
+  # fresh converter input every time: src + safari overlay, nothing else
+  local staging
+  staging="$(mktemp -d)/src"
+  info "Syncing src/ (+ safari/ overlay) for $slug..."
+  sync_staging "$slug" "$staging"
+
+  # regenerate the project from scratch: converter output is disposable
+  info "Converting with safari-web-extension-converter..."
+  rm -rf "$dir/project"
+  mkdir -p "$dir/project"
+  xcrun safari-web-extension-converter "$staging" \
+    --project-location "$dir/project" \
+    --app-name "$app_name" \
+    --bundle-identifier "$bundle_id" \
+    --macos-only --copy-resources --no-open --no-prompt --force
+
+  local project="$dir/project/$app_name/$app_name.xcodeproj"
+  [ -d "$project" ] || die "converter did not produce $project"
+  normalize_bundle_ids "$project"
+
+  local build_dir log_file
+  build_dir="$(mktemp -d)"
+  log_file="$(mktemp)"
+
+  info "Building..."
+  # judge success by the product existing, not by grep's exit code
+  set +e
+  xcodebuild \
+      -project "$project" \
+      -scheme "$app_name" \
+      -configuration Release \
+      -derivedDataPath "$build_dir" \
+      -allowProvisioningUpdates \
+      DEVELOPMENT_TEAM="$TEAM_ID" \
+      CODE_SIGN_STYLE=Automatic \
+      build 2>&1 | tee "$log_file" | grep -E "BUILD|error|Cycle"
+  set -e
+
+  local app="$build_dir/Build/Products/Release/$app_name.app"
+  if [ ! -d "$app" ]; then
+    echo "" >&2
+    echo "ERROR: build failed. Last 40 lines of full output:" >&2
+    tail -40 "$log_file" >&2
+    die "see above for the real error (full log: $log_file)"
+  fi
+
+  info "Verifying signature..."
+  codesign --verify --deep --strict "$app"
+
+  info "Installing to /Applications..."
+  rm -rf "/Applications/$app_name.app"
+  mv "$app" /Applications/
+  "$LSREGISTER" -f -R -trusted "/Applications/$app_name.app" 2>/dev/null || true
+  rm -rf "$build_dir" "$log_file"
+
   echo ""
-  echo "Done (build only)."
-  echo "  Built app:   $APP"
-  echo "  Source:      $OUT_DIR/project/$APP_NAME"
-  echo "  Reinstall:   ./chrome-to-safari.sh --install-only $OUT_DIR --app \"$APP_NAME\""
-  echo "  (The output folder is git-ready: commit project/, build/ is ignored.)"
-  exit 0
-fi
+  echo "Done: $slug is installed. Enable it in Safari > Settings > Extensions."
 
-# --- Install + launch -----------------------------------------------------------
-echo "==> Installing to /Applications..."
-rm -rf "/Applications/$APP_NAME.app"
-mv "$APP" /Applications/
+  if [ "$no_launch" != "--no-launch" ]; then
+    open -a "/Applications/$app_name.app"
+    sleep 2
+    open -a Safari
+  fi
+}
 
-/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister \
-  -f -R -trusted "/Applications/$APP_NAME.app"
+managed_slugs() { # every extensions/<dir> holding a meta.json, sorted
+  local d
+  for d in "$EXTENSIONS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    [ -f "$d/meta.json" ] || continue
+    basename "$d"
+  done | sort
+}
 
-open -a "/Applications/$APP_NAME.app"
-sleep 2
-open -a Safari
+resolve_slugs() { # <slug|all> -> slugs to operate on
+  local want="${1:-all}"
+  if [ "$want" = "all" ]; then
+    managed_slugs
+    return 0
+  fi
+  [ -f "$EXTENSIONS_DIR/$want/meta.json" ] || die "no managed extension named '$want' (run: $0 list)"
+  printf '%s\n' "$want"
+}
 
-# The generated project and build tree hold extra copies of the extension.
-# Once the app is in /Applications they're dead weight; a re-run regenerates
-# everything from scratch anyway. Use --build-only if you want to keep them.
-# Only remove the two directories this script created, never OUT_DIR wholesale.
-rm -rf "$OUT_DIR/project/$APP_NAME" "$BUILD_SUB"
-rmdir "$OUT_DIR/project" "$OUT_DIR" 2>/dev/null || true
+# --- commands -------------------------------------------------------------------
 
-echo ""
-echo "Done. Enable it in Safari > Settings > Extensions."
+cmd_list() {
+  local slugs=()
+  local IFS=$'\n'
+  # bash 3.2 + set -u: guard empty-array expansion
+  slugs=($(managed_slugs) ${slugs[@]+"${slugs[@]}"})
+  if [ ${#slugs[@]} -eq 0 ]; then
+    echo "No extensions yet. Add one:"
+    echo "  $0 add <chrome-web-store-url>"
+    echo "  $0 add /path/to/unpacked-extension"
+    return 0
+  fi
+  printf '%-18s %-24s %-9s %s\n' "SLUG" "APP" "VERSION" "STATUS"
+  local slug app ver overlay installed status
+  for slug in "${slugs[@]}"; do
+    app="$(json_field "$EXTENSIONS_DIR/$slug/meta.json" app_name)"
+    ver="$(json_field "$EXTENSIONS_DIR/$slug/meta.json" upstream_version)"
+    overlay=""
+    [ -n "$(ls "$EXTENSIONS_DIR/$slug/safari" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ] && overlay="+overlay"
+    installed=""
+    [ -d "/Applications/$app.app" ] && installed="installed"
+    status="$installed$overlay"
+    [ -z "$status" ] && status="-"
+    printf '%-18s %-24s %-9s %s\n' "$slug" "$app" "$ver" "$status"
+  done
+}
+
+write_meta() { # <meta-path> <slug> <name> <bundle-id> <origin> <store-url-or-> <extid-or-> <version>
+  python3 - "$@" <<'PY'
+import json, sys, datetime
+
+path, slug, name, bundle_id, origin, store_url, ext_id, version = sys.argv[1:9]
+meta = {
+    "slug": slug,
+    "app_name": name,
+    "bundle_id": bundle_id,
+    "origin": origin,
+    "store_url": None if store_url == "-" else store_url,
+    "extension_id": None if ext_id == "-" else ext_id,
+    "upstream_version": version,
+    "added": datetime.date.today().isoformat(),
+}
+with open(path, "w") as f:
+    json.dump(meta, f, indent=2)
+    f.write("\n")
+PY
+}
+
+cmd_add() {
+  local source="" opt_name="" opt_bundle="" no_install=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)       opt_name="${2:-}"; shift 2 ;;
+      --bundle-id)  opt_bundle="${2:-}"; shift 2 ;;
+      --no-install) no_install="1"; shift ;;
+      *) [ -z "$source" ] && source="$1" || die "unexpected argument: $1"; shift ;;
+    esac
+  done
+  [ -n "$source" ] || die "add needs a Chrome Web Store URL or a folder path"
+
+  local source_dir ext_id="" store_url="" url_slug=""
+  if [[ "$source" == http*://* ]]; then
+    ext_id="$(store_id_from_url "$source")"
+    [ -n "$ext_id" ] || die "no extension ID in that URL. Expected a Chrome Web Store link like https://chromewebstore.google.com/detail/<name>/<32-char-id>"
+    store_url="$source"
+    url_slug="$(url_slug_from_store_url "$source")"
+    source_dir="$(crx_fetch "$ext_id")"
+  else
+    [ -d "$source" ] || die "no such folder: $source"
+    [ -f "$source/manifest.json" ] || die "no manifest.json in $source — is this a WebExtension?"
+    source_dir="$(cd "$source" && pwd)"
+  fi
+
+  local name slug version
+  name="$(manifest_name "$source_dir/manifest.json")"
+  [ -n "$opt_name" ] && name="$opt_name"
+  [ -n "$name" ] || name="$url_slug"
+  [ -n "$name" ] || name="$(basename "$source_dir")"
+  case "$name" in __MSG_*) name="$url_slug";; esac
+  [ -n "$name" ] || name="$(basename "$source_dir")"
+
+  slug="$(slugify "${C2S_SLUG:-$name}")"
+  [ -n "$slug" ] || die "could not derive a slug from '$name' — pass --name"
+  [ -e "$EXTENSIONS_DIR/$slug" ] && die "extensions/$slug already exists"
+
+  version="$(manifest_field "$source_dir/manifest.json" version)"
+
+  local dir="$EXTENSIONS_DIR/$slug"
+  mkdir -p "$EXTENSIONS_DIR" "$dir/src" "$dir/safari"
+  info "Vendoring source into extensions/$slug/src ..."
+  cp -R "$source_dir/." "$dir/src/"
+  rm -rf "$dir/src/_metadata" "$dir/src/.git" "$dir/src/.github"
+  find "$dir/src" -name '.DS_Store' -delete 2>/dev/null || true
+
+  local bundle_id
+  bundle_id="${opt_bundle:-com.converted.$slug}"
+
+  write_meta "$dir/meta.json" "$slug" "$name" "$bundle_id" \
+    "$( [ -n "$store_url" ] && echo store || echo local )" \
+    "${store_url:--}" "${ext_id:--}" "${version:-0}"
+
+  # anchor commit: marks the pristine upstream so `update` can replay your
+  # future tweak-commits onto new upstream versions
+  if repo_is_git; then
+    local rel
+    rel="$(ext_rel_path "$slug")"
+    git_run add "$rel"
+    if ! git_run commit -q -m "[c2s] $slug v${version:-0}"; then
+      info "WARNING: anchor commit failed — update's rebase needs it. Commit manually."
+    fi
+  fi
+
+  echo "==> Added:     extensions/$slug"
+  echo "==> App name:  $name"
+  echo "==> Bundle ID: $bundle_id"
+
+  if [ -n "$no_install" ]; then
+    echo ""
+    echo "Install later with:"
+    echo "  $0 install $slug"
+    return 0
+  fi
+
+  build_and_install_one "$slug"
+}
+
+cmd_install() {
+  local target="" no_launch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-launch) no_launch="--no-launch"; shift ;;
+      *) if [ -z "$target" ]; then target="$1"; shift; else die "unexpected argument: $1"; fi ;;
+    esac
+  done
+  target="${target:-all}"
+
+  if [ "$target" != "all" ]; then
+    build_and_install_one "$target" "$no_launch"
+    return 0
+  fi
+
+  local failed=0 slug any=0
+  while IFS= read -r slug; do
+    [ -n "$slug" ] || continue
+    any=1
+    echo ""
+    echo "### $slug"
+    build_and_install_one "$slug" "--no-launch" || { failed=1; continue; }
+  done < <(resolve_slugs all)
+  [ "$any" -eq 1 ] || { echo "Nothing to install — no managed extensions yet."; return 0; }
+  if [ "$failed" -eq 0 ] && [ -z "$no_launch" ]; then
+    open -a Safari
+  fi
+  [ "$failed" -eq 0 ] || die "one or more installs failed"
+}
+
+cmd_update() {
+  local check="" no_install="" target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check)      check="1"; shift ;;
+      --no-install) no_install="1"; shift ;;
+      *) if [ -z "$target" ]; then target="$1"; shift; else die "unexpected argument: $1"; fi ;;
+    esac
+  done
+  target="${target:-all}"
+
+  local failed=0 slug any=0
+  while IFS= read -r slug; do
+    [ -n "$slug" ] || continue
+    any=1
+    update_one "$slug" "$check" "$no_install" || failed=1
+  done < <(resolve_slugs "$target")
+  [ "$any" -eq 1 ] || { echo "Nothing to update — no managed extensions yet."; return 0; }
+  [ "$failed" -eq 0 ] || die "one or more updates failed"
+}
+
+update_one() { # <slug> [--check] [--no-install]
+  local slug="$1" check="${2:-}" no_install="${3:-}"
+  local dir="$EXTENSIONS_DIR/$slug"
+  local meta="$dir/meta.json"
+  [ -f "$meta" ] || { echo "ERROR: no meta.json for '$slug'" >&2; return 1; }
+
+  local ext_id store_url
+  ext_id="$(json_field "$meta" extension_id)"
+  store_url="$(json_field "$meta" store_url)"
+  [ -n "$ext_id" ] || ext_id="$(store_id_from_url "${store_url:-}")"
+  if [ -z "$ext_id" ]; then
+    echo "### $slug"
+    echo "No upstream recorded (local extension) — nothing to update."
+    return 0
+  fi
+
+  echo ""
+  echo "### $slug"
+  local vendored_ver fresh remote_ver
+  vendored_ver="$(manifest_field "$dir/src/manifest.json" version)"
+  fresh="$(crx_fetch "$ext_id")"
+  remote_ver="$(manifest_field "$fresh/manifest.json" version)"
+
+  if [ "$vendored_ver" = "$remote_ver" ]; then
+    echo "Up to date ($vendored_ver). Nothing to do."
+    return 0
+  fi
+
+  echo "Update available:"
+  echo "  vendored: $vendored_ver"
+  echo "  upstream: $remote_ver"
+  local changed
+  changed="$(diff -rq "$dir/src" "$fresh" 2>/dev/null | wc -l | tr -d ' ')"
+  echo "  changed paths: $changed"
+  diff -rq "$dir/src" "$fresh" 2>/dev/null | head -15 | sed 's/^/    /' || true
+  [ "$changed" -gt 15 ] && echo "    ..."
+
+  if [ -n "$check" ]; then
+    echo "(check only — nothing changed. Apply with: $0 update $slug)"
+    return 0
+  fi
+
+  if ! repo_is_git; then
+    rm -rf "$dir/src"
+    mkdir -p "$dir/src"
+    cp -R "$fresh/." "$dir/src/"
+    meta_set_version "$meta" "$remote_ver"
+    echo "WARNING: not a git repo — replaced src/ directly; any edits were overwritten."
+    return 0
+  fi
+
+  local dirty rel
+  rel="$(ext_rel_path "$slug")"
+  dirty="$(git_run status --porcelain -- "$rel" || true)"
+  [ -n "$dirty" ] && die "'$slug' has uncommitted changes. Commit or stash them first, then re-run update."
+
+  old_head="$(git_run rev-parse HEAD)"
+  cur_branch="$(git_run symbolic-ref --short -q HEAD || true)"
+  old_up="$(git_run log --format=%H -E --grep='^\[c2s\]' -1 -- "$rel/src" || true)"
+  if [ -z "$old_up" ]; then
+    die "no '[c2s]' anchor commit found for $slug/src — cannot rebase automatically.
+Fix by hand: replace extensions/$slug/src with the new version and commit it."
+  fi
+
+  tweaks="$(git_run rev-list --count "$old_up..$old_head" || echo 0)"
+
+  if [ "$tweaks" -eq 0 ]; then
+    # nobody tweaked this extension yet: just vendor the new upstream
+    rm -rf "$dir/src"
+    mkdir -p "$dir/src"
+    cp -R "$fresh/." "$dir/src/"
+    meta_set_version "$meta" "$remote_ver"
+    git_run add "$rel/src" "$meta"
+    git_run commit -q -m "[c2s] $slug v$remote_ver"
+    echo "Vendored upstream $remote_ver (you had no local commits to replay)."
+  else
+    # Build the updated history beside the branch: new upstream commit on top
+    # of the anchor, then your tweak-commits cherry-picked onto it. The branch
+    # ref moves only if everything replays cleanly; until then,
+    # `git cherry-pick --abort` restores the exact pre-update state.
+    git_run checkout -q --detach "$old_up"
+    rm -rf "$dir/src"
+    mkdir -p "$dir/src"
+    cp -R "$fresh/." "$dir/src/"
+    meta_set_version "$meta" "$remote_ver"
+    git_run add "$rel/src" "$meta"
+    git_run commit -q -m "[c2s] $slug v$remote_ver"
+
+    echo "Replaying your $tweaks commit(s) onto upstream $remote_ver ..."
+    local pick_ok=1
+    git_run cherry-pick "$old_up..$old_head" || pick_ok=0
+    if [ "$pick_ok" -eq 0 ]; then
+      cat >&2 <<EOF
+
+Replay stopped on a conflict — your edits and the upstream change touch the
+same code. Resolve it in git terms:
+  cd $REPO_ROOT
+  git status                            # see conflicted files
+  # edit files, then:
+  git add -A && git cherry-pick --continue
+When the replay finishes, move your branch onto it:
+  git checkout -B $cur_branch
+(or bail out entirely: git cherry-pick --abort)
+Then re-run: $0 install $slug
+EOF
+      return 1
+    fi
+
+    if [ -n "$cur_branch" ]; then
+      git_run checkout -q -B "$cur_branch"
+      echo "Rebase clean: your commits sit on top of upstream $remote_ver."
+    else
+      echo "Replayed cleanly (detached HEAD — attach a branch with: git checkout -B <name>)"
+    fi
+  fi
+
+  if [ -n "$no_install" ]; then
+    echo "Skipping install (--no-install). Run: $0 install $slug"
+    return 0
+  fi
+  build_and_install_one "$slug"
+}
+
+cmd_ui() {
+  local ui_src="$REPO_ROOT/ui.swift"
+  local ui_bin="$REPO_ROOT/.ui/ChromeToSafari"
+  if [ ! -x "$ui_bin" ] || [ "$ui_src" -nt "$ui_bin" ]; then
+    info "Compiling the UI (first run only)..."
+    mkdir -p "$REPO_ROOT/.ui"
+    swiftc -O -parse-as-library "$ui_src" -o "$ui_bin"
+  fi
+  exec env C2S_SCRIPT="$SCRIPT_PATH" "$ui_bin"
+}
+
+# --- dispatch -------------------------------------------------------------------
+
+case "${1:-}" in
+  ui|--ui)         cmd_ui ;;
+  help|-h|--help)  usage ;;
+  "")              usage ;;
+  add)             shift; cmd_add "$@" ;;
+  list|ls)         cmd_list ;;
+  install)         shift; cmd_install "$@" ;;
+  update)          shift; cmd_update "$@" ;;
+  # legacy muscle-memory: a bare path or URL means "add this"
+  *)               cmd_add "$@" ;;
+esac

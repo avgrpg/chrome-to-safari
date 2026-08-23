@@ -2,14 +2,17 @@
 // Compiled on first run by `./chrome-to-safari.sh --ui` (swiftc, no Xcode project).
 // The shell script stays the single source of truth; this window just runs it
 // and shows its output.
+//
+// Tabs:
+//   Extensions — every entry under <repo>/extensions/: install, check updates.
+//   Add        — vendor a new extension from a store URL or unpacked folder.
 
 import SwiftUI
 import UniformTypeIdentifiers
 
-enum ConversionMode: String, CaseIterable, Identifiable {
-    case convert = "Convert"
-    case buildOnly = "Build Only"
-    case installOnly = "Install Only"
+enum AppTab: String, CaseIterable, Identifiable {
+    case extensions = "Extensions"
+    case add = "Add"
 
     var id: String { rawValue }
 }
@@ -20,41 +23,47 @@ struct Step: Identifiable {
     var done = false
 }
 
-struct DiscoveredProject: Identifiable, Hashable {
-    let id: String      // path
-    let name: String
-    let path: String
+struct ExtensionEntry: Identifiable {
+    let id: String          // slug
+    let appName: String
+    let version: String
+    let origin: String      // "local" | "store"
+    let hasOverlay: Bool
+    let installed: Bool
 }
 
 final class Runner: ObservableObject {
     static let scriptPath = ProcessInfo.processInfo.environment["C2S_SCRIPT"]
         ?? FileManager.default.currentDirectoryPath + "/chrome-to-safari.sh"
 
+    static var repoRoot: String {
+        URL(fileURLWithPath: scriptPath).deletingLastPathComponent().path
+    }
+
+    static var extensionsDir: String {
+        repoRoot + "/extensions"
+    }
+
     @Published var steps: [Step] = []
     @Published var log = ""
     @Published var running = false
     @Published var finished = false
     @Published var succeeded = false
+    @Published var lastVerb = ""
 
     private var process: Process?
 
-    func run(input: String, env: [String: String] = [:], mode: ConversionMode = .convert) {
+    func run(arguments: [String], env: [String: String] = [:]) {
         steps = []
         log = ""
         finished = false
         succeeded = false
         running = true
+        lastVerb = arguments.first ?? ""
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        switch mode {
-        case .convert:
-            proc.arguments = [Self.scriptPath, input]
-        case .buildOnly:
-            proc.arguments = [Self.scriptPath, input, "--build-only"]
-        case .installOnly:
-            proc.arguments = [Self.scriptPath, "--install-only"]
-        }
+        proc.arguments = [Self.scriptPath] + arguments
         var environment = ProcessInfo.processInfo.environment
         for (key, value) in env where !value.trimmingCharacters(in: .whitespaces).isEmpty {
             environment[key] = value
@@ -101,55 +110,43 @@ final class Runner: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var runner = Runner()
+    @State private var tab: AppTab = .extensions
+
+    // Add tab state
     @State private var input = ""
     @State private var dropTargeted = false
-    @State private var showLog = false
+    @State private var newAppName = ""
+    @State private var newBundleID = ""
+
+    // Options
     @State private var showOptions = false
-    @State private var appName = ""
-    @State private var bundleID = ""
     @State private var teamID = ""
-    @State private var mode: ConversionMode = .convert
-    @AppStorage("c2sScanRoot") private var scanRoot = ""
-    @State private var discovered: [DiscoveredProject] = []
+
+    @State private var showLog = false
+    @State private var entries: [ExtensionEntry] = []
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Picker("Mode", selection: $mode) {
-                ForEach(ConversionMode.allCases) { m in
-                    Text(m.rawValue).tag(m)
+        VStack(alignment: .leading, spacing: 16) {
+            Picker("Tab", selection: $tab) {
+                ForEach(AppTab.allCases) { t in
+                    Text(t.rawValue).tag(t)
                 }
             }
             .pickerStyle(.segmented)
             .disabled(runner.running)
 
-            workspaceRow
-
-            if mode != .installOnly {
-                dropZone
-            } else {
-                discovery
+            switch tab {
+            case .extensions: extensionsPane
+            case .add: addPane
             }
 
             VStack(spacing: 12) {
-                HStack(spacing: 8) {
-                    Image(systemName: mode == .installOnly ? "folder" : "link")
-                        .foregroundStyle(.secondary)
-                    TextField(mode == .installOnly
-                              ? "Output folder created by Build Only"
-                              : "Store link or folder path",
-                              text: $input)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(runner.running)
-                        .onSubmit(convert)
-                }
-
-                Button(action: convert) {
+                Button(action: primaryAction) {
                     HStack(spacing: 8) {
                         if runner.running {
-                            ProgressView()
-                                .controlSize(.small)
+                            ProgressView().controlSize(.small)
                         }
-                        Text(runner.running ? runningLabel : buttonLabel)
+                        Text(runner.running ? runningLabel : primaryLabel)
                             .fontWeight(.medium)
                     }
                     .frame(maxWidth: .infinity)
@@ -157,91 +154,173 @@ struct ContentView: View {
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(runner.running || input.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!primaryEnabled)
             }
 
-            DisclosureGroup("Options", isExpanded: $showOptions) {
-                Text("Leave any field blank to use its default.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 10)
-
-                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 8) {
-                    optionRow("App Name", "from the extension's manifest", $appName)
-                    optionRow("Bundle ID", "com.converted.<name>", $bundleID)
-                    optionRow("Team ID", "auto-detected from your keychain", $teamID)
-                }
-                .font(.callout)
-                .disabled(runner.running)
-            }
-            .font(.callout)
+            optionsDisclosure
 
             if !runner.steps.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(runner.steps) { step in
-                        HStack(spacing: 8) {
-                            if step.done {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                            } else if runner.finished && !runner.succeeded {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundStyle(.red)
-                            } else {
-                                ProgressView()
-                                    .controlSize(.small)
-                            }
-                            Text(step.label)
-                                .font(.callout)
-                                .foregroundStyle(step.done ? .secondary : .primary)
-                        }
-                        .transition(.opacity)
-                    }
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quinary, in: RoundedRectangle(cornerRadius: 8))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color(nsColor: .separatorColor))
-                )
+                stepsBox
             }
 
             if runner.finished {
                 resultBanner
             }
 
-            DisclosureGroup("Log", isExpanded: $showLog) {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        Text(runner.log.isEmpty ? "No output yet." : runner.log)
-                            .font(.caption.monospaced())
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                            .padding(8)
-                        Color.clear.frame(height: 1).id("end")
-                    }
-                    .frame(height: 170)
-                    .background(.quinary, in: RoundedRectangle(cornerRadius: 8))
-                    .onChange(of: runner.log) { _ in proxy.scrollTo("end") }
-                    .padding(.top, 8)
-                }
-            }
-            .font(.callout)
+            logDisclosure
         }
         .padding(20)
-        .frame(width: 480)
+        .frame(width: 540)
         .animation(.easeOut(duration: 0.2), value: runner.steps.count)
         .animation(.easeOut(duration: 0.2), value: runner.finished)
-        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-            guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url { DispatchQueue.main.async { input = url.path } }
-            }
-            return true
+        .onChange(of: runner.finished) { _, done in
+            if done { refreshEntries() }
         }
         .onAppear {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
+            refreshEntries()
+        }
+    }
+
+    // MARK: - Extensions tab
+
+    private var extensionsPane: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("extensions/")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Refresh") { refreshEntries() }
+                    .disabled(runner.running)
+                Button("Install All") { runner.run(arguments: ["install", "all"]) }
+                    .disabled(runner.running || entries.isEmpty)
+            }
+            .font(.callout)
+
+            if entries.isEmpty {
+                VStack(spacing: 6) {
+                    Text("No extensions yet.")
+                        .font(.callout.weight(.medium))
+                    Text("Use the Add tab: paste a Chrome Web Store link or drop an unpacked folder.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+            } else {
+                ScrollView {
+                    VStack(spacing: 4) {
+                        ForEach(entries) { entry in
+                            extensionRow(entry)
+                        }
+                    }
+                }
+                .frame(maxHeight: 240)
+            }
+        }
+    }
+
+    private func extensionRow(_ entry: ExtensionEntry) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: entry.installed ? "puzzlepiece.extension.fill" : "puzzlepiece.extension")
+                .foregroundStyle(entry.installed ? Color.green : Color.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(entry.appName)
+                        .font(.callout.weight(.medium))
+                    Text("v\(entry.version)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if entry.hasOverlay {
+                        Text("safari overlay")
+                            .font(.caption2)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.15),
+                                        in: Capsule())
+                    }
+                    if entry.origin == "store" {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .help("forked from the Chrome Web Store — updates available via rebase")
+                    }
+                }
+                Text("\(entry.id) · \(entry.installed ? "installed" : "not installed")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button("Check") {
+                runner.run(arguments: ["update", "--check", entry.id])
+            }
+            .disabled(runner.running || entry.origin != "store")
+            .help(entry.origin == "store"
+                  ? "Look up the upstream version and diff"
+                  : "Local extension — no upstream to check")
+            Button("Install") {
+                runner.run(arguments: ["install", entry.id])
+            }
+            .disabled(runner.running)
+            .buttonStyle(.bordered)
+        }
+        .padding(8)
+        .background(.quinary, in: RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+    }
+
+    // MARK: - Add tab
+
+    private var addPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            dropZone
+
+            VStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "link")
+                        .foregroundStyle(.secondary)
+                    TextField("Store link or folder path", text: $input)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(runner.running)
+                }
+
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 8) {
+                    GridRow {
+                        Text("App Name")
+                            .foregroundStyle(.secondary)
+                            .gridColumnAlignment(.trailing)
+                        TextField("from the manifest", text: $newAppName)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("Bundle ID")
+                            .foregroundStyle(.secondary)
+                            .gridColumnAlignment(.trailing)
+                        TextField("com.converted.<slug>", text: $newBundleID)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+                .font(.callout)
+
+                Text("The source is vendored into extensions/<slug>/src as an anchor commit; your edits go on top as normal commits.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url {
+                    DispatchQueue.main.async {
+                        input = url.path
+                        tab = .add
+                    }
+                }
+            }
+            return true
         }
     }
 
@@ -272,79 +351,58 @@ struct ContentView: View {
         .animation(.easeOut(duration: 0.15), value: dropTargeted)
     }
 
-    private var workspaceRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Text("Converted Projects Folder")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if mode == .installOnly {
-                    Button("Scan") { refreshDiscoveries() }
+    // MARK: - Shared chrome
+
+    private var optionsDisclosure: some View {
+        DisclosureGroup("Options", isExpanded: $showOptions) {
+            Text("Leave any field blank to use its default.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 10)
+
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 8) {
+                GridRow {
+                    Text("Team ID")
+                        .gridColumnAlignment(.trailing)
+                        .foregroundStyle(.secondary)
+                    TextField("auto-detected from your keychain", text: $teamID)
+                        .textFieldStyle(.roundedBorder)
                 }
-                Button("…") { chooseScanRoot() }
             }
             .font(.callout)
-
-            HStack(spacing: 6) {
-                TextField("where your converted projects live", text: $scanRoot)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(runner.running)
-            }
-            .font(.callout)
-
-            if mode != .installOnly {
-                Text("Build Only writes each extension into <this folder>/project/.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            .disabled(runner.running)
         }
+        .font(.callout)
     }
 
-    private var discovery: some View {
-        Group {
-            if discovered.isEmpty {
-                Text("No converted projects found here. Set the folder above, or type an output folder path below.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(discovered) { p in
-                            Button {
-                                input = p.path
-                            } label: {
-                                HStack {
-                                    Image(systemName: "square.stack.3d.up.fill")
-                                        .foregroundStyle(.secondary)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(p.name)
-                                            .font(.callout.weight(.medium))
-                                        Text(p.path)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                    }
-                                    Spacer()
-                                    if input == p.path {
-                                        Image(systemName: "checkmark")
-                                            .foregroundStyle(Color.accentColor)
-                                    }
-                                }
-                                .padding(6)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .background(input == p.path ? Color.accentColor.opacity(0.12) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
-                        }
+    private var stepsBox: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(runner.steps) { step in
+                HStack(spacing: 8) {
+                    if step.done {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else if runner.finished && !runner.succeeded {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
                     }
+                    Text(step.label)
+                        .font(.callout)
+                        .foregroundStyle(step.done ? .secondary : .primary)
                 }
-                .frame(maxHeight: 150)
+                .transition(.opacity)
             }
         }
-        .onAppear { refreshDiscoveries() }
-        .onChange(of: scanRoot) { refreshDiscoveries() }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quinary, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color(nsColor: .separatorColor))
+        )
     }
 
     private var resultBanner: some View {
@@ -364,114 +422,115 @@ struct ContentView: View {
     }
 
     private var successMessage: String {
-        switch mode {
-        case .convert:
-            return "Done. Enable it in Safari → Settings → Extensions."
-        case .buildOnly:
-            return "Done. The built app is in the output folder — see the log for the path."
-        case .installOnly:
-            return "Done. Enable it in Safari → Settings → Extensions."
+        switch runner.lastVerb {
+        case "add":
+            return "Added and installed. Enable it in Safari → Settings → Extensions."
+        case "install":
+            return "Installed. Enable it in Safari → Settings → Extensions."
+        case "update":
+            return "Update applied and installed."
+        default:
+            return "Done."
         }
     }
 
-    private var buttonLabel: String {
-        switch mode {
-        case .convert:       return "Convert"
-        case .buildOnly:     return "Build"
-        case .installOnly:   return "Rebuild & Install"
+    private var logDisclosure: some View {
+        DisclosureGroup("Log", isExpanded: $showLog) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(runner.log.isEmpty ? "No output yet." : runner.log)
+                        .font(.caption.monospaced())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                    Color.clear.frame(height: 1).id("end")
+                }
+                .frame(height: 170)
+                .background(.quinary, in: RoundedRectangle(cornerRadius: 8))
+                .onChange(of: runner.log) { _, _ in proxy.scrollTo("end") }
+                .padding(.top, 8)
+            }
+        }
+        .font(.callout)
+    }
+
+    // MARK: - Actions
+
+    private var primaryEnabled: Bool {
+        guard !runner.running else { return false }
+        switch tab {
+        case .add: return !input.trimmingCharacters(in: .whitespaces).isEmpty
+        case .extensions: return !entries.isEmpty
+        }
+    }
+
+    private var primaryLabel: String {
+        switch tab {
+        case .add: return "Add & Install"
+        case .extensions: return "Check All Updates"
         }
     }
 
     private var runningLabel: String {
-        switch mode {
-        case .convert:       return "Converting…"
-        case .buildOnly:     return "Building…"
-        case .installOnly:   return "Rebuilding…"
+        switch tab {
+        case .add: return "Adding…"
+        case .extensions: return "Checking…"
         }
     }
 
-    private func convert() {
-        let value = input.trimmingCharacters(in: .whitespaces)
-        guard !value.isEmpty, !runner.running else { return }
-        var env = ["APP_NAME": appName, "BUNDLE_ID": bundleID, "TEAM_ID": teamID]
-        switch mode {
-        case .convert, .buildOnly:
-            if !scanRoot.isEmpty {
-                env["OUT_DIR"] = scanRoot
-            }
-        case .installOnly:
-            env["OUT_DIR"] = value
-        }
-        runner.run(input: value, env: env, mode: mode)
-    }
-
-    private func optionRow(_ label: String, _ defaultHint: String, _ text: Binding<String>) -> some View {
-        GridRow {
-            Text(label)
-                .gridColumnAlignment(.trailing)
-                .foregroundStyle(.secondary)
-            TextField(defaultHint, text: text)
-                .textFieldStyle(.roundedBorder)
+    private func primaryAction() {
+        let team = ["TEAM_ID": teamID]
+        switch tab {
+        case .add:
+            var args = ["add", input.trimmingCharacters(in: .whitespaces)]
+            let name = newAppName.trimmingCharacters(in: .whitespaces)
+            let bundle = newBundleID.trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty { args += ["--name", name] }
+            if !bundle.isEmpty { args += ["--bundle-id", bundle] }
+            runner.run(arguments: args, env: team)
+        case .extensions:
+            runner.run(arguments: ["update", "--check", "all"], env: team)
         }
     }
 
-    private func chooseScanRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.message = "Pick the folder that contains your converted projects"
-        if panel.runModal() == .OK, let url = panel.url {
-            scanRoot = url.path
-        }
+    private func refreshEntries() {
+        entries = Self.scanExtensions()
     }
 
-    // Find every converted app under a folder. Primary layout is a shared
-    // workspace: <dir>/project/<App>/<App>.xcodeproj. Falle back to a single-app
-    // output folder (<dir>/<App>/<App>.xcodeproj) for legacy setups.
-    private func appProjects(in dir: String) -> [URL] {
+    static func scanExtensions() -> [ExtensionEntry] {
         let fm = FileManager.default
-        let root = URL(fileURLWithPath: dir)
-        let projectRoot = root.appendingPathComponent("project")
-        if let apps = try? fm.contentsOfDirectory(atPath: projectRoot.path) {
-            let found = apps.compactMap { app -> URL? in
-                let proj = projectRoot.appendingPathComponent("\(app)/\(app).xcodeproj")
-                return fm.fileExists(atPath: proj.path) ? proj : nil
-            }
-            if !found.isEmpty { return found }
-        }
-        if let apps = try? fm.contentsOfDirectory(atPath: dir) {
-            let found = apps.filter { !$0.hasSuffix(".xcodeproj") }.compactMap { app -> URL? in
-                let proj = root.appendingPathComponent("\(app)/\(app).xcodeproj")
-                return fm.fileExists(atPath: proj.path) ? proj : nil
-            }
-            if !found.isEmpty { return found }
-        }
-        return []
-    }
+        let root = URL(fileURLWithPath: Runner.extensionsDir)
+        guard let slugs = try? fm.contentsOfDirectory(atPath: root.path) else { return [] }
+        var result: [ExtensionEntry] = []
+        for slug in slugs.sorted() {
+            let dir = root.appendingPathComponent(slug)
+            let metaPath = dir.appendingPathComponent("meta.json").path
+            guard fm.fileExists(atPath: metaPath),
+                  let data = fm.contents(atPath: metaPath),
+                  let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
 
-    private func refreshDiscoveries() {
-        discovered = []
-        guard !scanRoot.isEmpty else { return }
-        let fm = FileManager.default
-        let root = URL(fileURLWithPath: scanRoot)
-        var roots = [root]
-        if let entries = try? fm.contentsOfDirectory(
-                at: root, includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]) {
-            roots.append(contentsOf: entries.filter { $0.hasDirectoryPath })
-        }
-        var seen = Set<String>()
-        var items: [DiscoveredProject] = []
-        for candidate in roots {
-            for proj in appProjects(in: candidate.path) {
-                let appDir = proj.deletingLastPathComponent().path
-                guard seen.insert(appDir).inserted else { continue }
-                let name = proj.deletingLastPathComponent().lastPathComponent
-                items.append(DiscoveredProject(id: appDir, name: name, path: appDir))
+            let appName = meta["app_name"] as? String ?? slug
+            let version = (meta["upstream_version"] as? String) ?? "-"
+            let origin = meta["origin"] as? String ?? "local"
+
+            let safariDir = dir.appendingPathComponent("safari")
+            var hasOverlay = false
+            if let items = try? fm.contentsOfDirectory(atPath: safariDir.path) {
+                hasOverlay = items.contains { $0 != ".gitkeep" && !$0.hasPrefix(".") }
             }
+
+            let appPath = "/Applications/\(appName).app"
+            let installed = fm.fileExists(atPath: appPath)
+
+            result.append(ExtensionEntry(id: slug,
+                                         appName: appName,
+                                         version: version.isEmpty ? "-" : version,
+                                         origin: origin,
+                                         hasOverlay: hasOverlay,
+                                         installed: installed))
         }
-        items.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        discovered = items
+        return result
     }
 
     private func chooseFolder() {

@@ -4,9 +4,32 @@ Turn any Chrome extension (or any WebExtension) into a working, signed Safari ex
 
 Safari can run Chrome extensions, but unsigned ones get **disabled every time Safari restarts**, so you're forever re-ticking "Allow unsigned extensions" in the Develop menu. This tool signs the extension with a **free** Apple ID, so once you enable it in Safari it stays enabled for good.
 
+This repo is also the **farm**: every extension you convert lives here as source, so you can edit it, keep Safari-only tweaks separate, replay your edits when the upstream extension updates, and clone the whole farm to another Mac and reinstall with one command.
+
 ## Demo
 
 https://github.com/user-attachments/assets/44111fd5-4475-4d19-8c9f-11b571000dcc
+
+## The model
+
+Each managed extension lives in `extensions/<slug>/`:
+
+```
+extensions/
+└── <slug>/
+    ├── src/        # ← THE Chrome source. Edit here. Always.
+    │               #   For store forks: pristine upstream + your changes
+    │               #   as git commits on top of an "[c2s]" anchor commit.
+    ├── safari/     # optional overlay, copied over src/ at build time:
+    │               #   any file here replaces/added-to src/,
+    │               #   manifest.patch.json deep-merges into manifest.json.
+    │               #   Use for Safari-only shims, keys, permissions.
+    ├── meta.json   # app name, bundle id, store origin + version
+    └── project/    # GENERATED converter output — disposable. Rebuilt from
+                    # scratch on every install; gitignored; NEVER edit here.
+```
+
+The rule that kills all confusion: **`src/` (+ `safari/`) is the only place edits live.** `project/` is regenerated from them on every install, so nothing you do anywhere else can ever be lost or go stale.
 
 ## Quick start
 
@@ -19,128 +42,133 @@ https://github.com/user-attachments/assets/44111fd5-4475-4d19-8c9f-11b571000dcc
 **2. Open the app:**
 
 ```bash
-./chrome-to-safari.sh --ui
+./chrome-to-safari.sh ui
 ```
 
-A window opens. Drop your unpacked extension folder onto it (or click to pick one), **or** paste a Chrome Web Store link, then hit **Convert**. That's it — when it finishes, enable the extension once in **Safari → Settings → Extensions** and you're done.
+Two tabs:
 
-<img src="docs/app.png" alt="The chrome-to-safari app window" width="480">
+- **Extensions** — everything under `extensions/`, with installed/version status. One click to **Install**, one to **Check** for upstream updates, plus **Install All** and **Check All Updates**.
+- **Add** — paste a Chrome Web Store link or drop an unpacked folder; the extension is vendored into `extensions/<slug>/`, converted, built, signed, installed.
 
-The app builds itself from [ui.swift](ui.swift) the first time you run `--ui`, using the Xcode tools you already have. Nothing is downloaded, so there are no Gatekeeper warnings. The **Options** section is optional — leave every field blank and it picks sensible defaults.
+The app builds itself from [ui.swift](ui.swift) on first run using the Xcode tools you already have. Nothing is downloaded, so there are no Gatekeeper warnings.
 
 ## Command line
 
-Prefer the terminal? Point the script straight at a folder or a store link:
+```bash
+# Add from a store link (vendored + converted + built + installed)
+./chrome-to-safari.sh add "https://chromewebstore.google.com/detail/<name>/<id>"
+
+# Add from a local unpacked folder
+./chrome-to-safari.sh add /path/to/extension --no-install
+
+# See what's in the farm
+./chrome-to-safari.sh list
+
+# Install (syncs src/+safari/, regenerates project/, builds, signs, installs)
+./chrome-to-safari.sh install <slug>
+./chrome-to-safari.sh install all
+
+# Upstream updates for store forks — check first, then apply
+./chrome-to-safari.sh update <slug> --check   # version delta + changed paths, touches nothing
+./chrome-to-safari.sh update <slug>           # vendors new upstream, replays your commits
+```
+
+Typing an old-style bare path or URL without a verb is shorthand for `add`.
+
+## Editing an extension
+
+Edit files in `extensions/<slug>/src/`. Then rebuild and reinstall:
 
 ```bash
-# A local unpacked extension folder
-./chrome-to-safari.sh /path/to/extension
-
-# A Chrome Web Store link (downloaded and unpacked for you)
-./chrome-to-safari.sh "https://chromewebstore.google.com/detail/<name>/<id>"
-
-# Convert and build, but don't install to /Applications
-./chrome-to-safari.sh /path/to/extension --build-only
+./chrome-to-safari.sh install <slug>
 ```
 
-Each run converts the extension, builds the wrapper app, signs it, installs it to `/Applications`, and opens Safari.
+You can test-drive logic quickly in Chrome while iterating: load `src/` unpacked at `chrome://extensions`, tweak, hit reload — seconds per cycle. When it feels right, one `install` brings it into Safari.
 
-### Add an extension, then edit and reinstall
+## Safari-specific tweaks (`safari/` overlay)
 
-Use one **converted projects folder** (a "workspace") to hold every extension you convert. Each `--build-only` run drops a new app into `<workspace>/project/`:
+Anything that exists *only* for Safari goes in `extensions/<slug>/safari/` instead of polluting the Chrome source:
+
+- **Whole files**: a file at `safari/content.js` replaces `src/content.js`; `safari/shim.js` is added outright.
+- **Manifest keys**: `safari/manifest.patch.json` is deep-merged over the staged `manifest.json` — e.g. swap `background.service_worker` for a Safari-compatible variant or request extra permissions:
+
+  ```json
+  { "background": { "scripts": ["background.js"] } }
+  ```
+
+At build time the script stages `src/`, copies the overlay over it, applies the patch, and feeds the result to Apple's converter. Chrome never sees the overlay; Safari always gets it.
+
+## Updating a forked extension
+
+For extensions vendored from the Chrome Web Store, your history looks like:
+
+```
+[c2s] slug v1.2.0        ← pristine upstream (anchor commit, made by `add`)
+├─ your fix A            ← ordinary commits you made
+└─ your fix B
+```
+
+When the original author ships something cool:
 
 ```bash
-# Step 1 (once): pick a workspace and convert + build an extension
-OUT_DIR=/path/to/workspace ./chrome-to-safari.sh /path/to/extension --build-only
-
-# Step 2: Edit the extension source in the generated Xcode project
-#   The converted files are in: <workspace>/project/<app-name>/
-
-# Step 3: Rebuild + install just that app from the existing project
-./chrome-to-safari.sh --install-only /path/to/workspace --app "<app-name>"
+./chrome-to-safari.sh update slug --check   # what changed? is it worth it?
+./chrome-to-safari.sh update slug           # apply it
 ```
 
-Repeat step 2 and 3 as many times as you like — edit the source and re-run `--install-only`. Convert another extension (same `OUT_DIR`) and it lands in the same `<workspace>/project/`, so one folder holds all of them.
+`update` re-vendors the new upstream on top of the anchor and replays your commits after it. If your edit and the upstream change touch the same lines, it stops and tells you exactly how to finish in git terms (`git status` → edit → `git cherry-pick --continue` → `git checkout -B main`). Until you resolve, nothing has moved — `git cherry-pick --abort` restores the exact pre-update state.
 
-The workspace has this layout. `project/` is the source you edit and commit; `build/` is generated DerivedData that's never committed (the tool writes a `.gitignore` for you):
+Local extensions (no upstream) simply report "nothing to update".
 
-```
-<workspace>/
-├── .gitignore        # generated: ignores build/ and junk
-├── project/          # ← converted source: one folder per app, commit this
-│   ├── <app-a>/<app-a>.xcodeproj/
-│   └── <app-b>/<app-b>.xcodeproj/
-└── build/<slug>/     # per-app DerivedData — generated, never committed
-```
+## Syncing to another Mac
 
-In the UI this is driven by the single **Converted Projects Folder** field, shared by both modes: **Build Only** writes each extension into `<workspace>/project/`, and **Install Only** auto-scans that folder and lists every converted app — just click one to install (or use `--app "<name>"` on the command line if the folder holds several).
-
-### Sync the converted project between machines (git)
-
-Because signing is per-machine (each Mac must sign its own build with its own free Apple Development certificate), the right way to move converted extensions between Macs is to share the **workspace source** and build on each machine:
+Signing is per-machine (each Mac must sign with its own free certificate), so machines share **source**, never built apps. Since the whole farm *is* this repo:
 
 ```bash
-# --- Machine A (edit + publish) ---
-OUT_DIR=/path/to/workspace ./chrome-to-safari.sh /path/to/extension --build-only
-cd /path/to/workspace
-git init && git add . && git commit -m "Safari extensions"   # build/ is already ignored
-git remote add origin <your-repo-url> && git push -u origin main
-
-# later: edit source under project/, add more apps, re-commit, re-push as usual
-
-# --- Machine B (consume + install) ---
-git clone <your-repo-url> /path/to/workspace
-./chrome-to-safari.sh --install-only /path/to/workspace --app "<app-name>"
+# --- Machine B (one time) ---
+git clone <this-repo-url>
+cd chrome-to-safari
+./chrome-to-safari.sh install all
 ```
 
-`--install-only` rebuilds from the committed `project/` source and signs it locally — no built code ever needs to be in git, and the working tree stays clean after install (DerivedData is built to a temp folder and removed). If the workspace holds several apps and you don't pass `--app`, the script prints the list of apps to choose from.
+That's it — every managed extension is rebuilt from committed source, signed locally, and installed. Bundle IDs come from each `meta.json`, so settings and permissions survive the trip.
 
 ## Requirements
 
 - macOS with **Xcode** installed (the full app, not just Command Line Tools — the converter and build need it)
 - A free Apple Development certificate (the one-time step above). The script auto-detects it on every run; if it's missing, it stops and prints these same instructions.
 
-### Options (environment variables)
+## What `install` does, step by step
 
-These match the **Options** section in the app. All optional.
+1. **Stages** `src/` + the `safari/` overlay into a temp dir (applying the manifest patch).
+2. **Converts** with Apple's `xcrun safari-web-extension-converter` into a fresh `project/` (the old one is replaced — it holds no edits by design).
+3. **Fixes a converter quirk**: normalizes mismatched bundle identifiers ("Embedded binary's bundle identifier is not prefixed…") so the build doesn't break.
+4. **Builds** with `xcodebuild`, injecting your team ID so both targets are signed with your free certificate.
+5. **Verifies** the code signature.
+6. **Installs** to `/Applications`, registers with Launch Services, and opens the app + Safari.
 
-| Variable    | Default                              | Purpose                          |
-|-------------|--------------------------------------|----------------------------------|
-| `APP_NAME`  | `"name"` field from `manifest.json`  | Display name of the wrapper app  |
-| `BUNDLE_ID` | `com.converted.<slug>`               | Bundle identifier                |
-| `TEAM_ID`   | auto-detected from your keychain     | Apple team ID (if you have several certificates) |
-| `OUT_DIR`   | `<extension-parent>/<slug>-safari`   | Where the converted source (`project/`) and build output (`build/`) go |
+No step deletes anything you could have edited. Re-running is always safe.
 
-Example:
+## Options
 
-```bash
-APP_NAME="My Cool Extension" BUNDLE_ID=com.me.coolext ./chrome-to-safari.sh ./my-extension
-```
+| Env var         | Default                          | Purpose                                            |
+|-----------------|----------------------------------|----------------------------------------------------|
+| `TEAM_ID`       | auto-detected from your keychain | Apple team ID (if you have several certificates)   |
+| `C2S_EXTENSIONS`| `<repo>/extensions`              | Where the farm lives                               |
 
-## What it does, step by step
-
-1. **Downloads the extension first, if you gave it a store link.** It pulls the `.crx` from Google's own update endpoint (the same one Chrome uses), unpacks it, and strips the store's `_metadata` folder. Note: fetching a `.crx` outside Chrome is technically against the Web Store terms — fine for converting an extension for your own use, but know that's what's happening.
-2. **Reads `manifest.json`** to name the app (handles `__MSG_*__` i18n placeholders by falling back to the folder name).
-3. **Converts** with Apple's `xcrun safari-web-extension-converter`, copying your extension's resources into a fresh Xcode project under `<OUT_DIR>/project/`.
-4. **Fixes a converter quirk**: the generated app and extension targets can end up with mismatched bundle identifiers, which breaks the build with *"Embedded binary's bundle identifier is not prefixed with the parent app's bundle identifier"*. The script normalizes the extension ID to `<app ID>.Extension`.
-5. **Builds** with `xcodebuild`, injecting your team ID so both targets are signed with your free Apple Development certificate.
-6. **Verifies** the code signature.
-7. **Installs** the app to `/Applications`, registers it with Launch Services, and launches it plus Safari.
-8. **Cleans up after itself**: once the app is in `/Applications`, the generated Xcode project and build tree are deleted so you don't end up with duplicate copies of the extension. Pass `--build-only` if you want to keep them (the `project/` source plus a `.gitignore`, ready to commit).
-
-Re-running the script is safe: it re-converts and rebuilds from scratch each time, so just run it again after changing your extension's source.
+`add` flags: `--name`, `--bundle-id` override what's read from the manifest; `--no-install` skips building.
 
 ## Limitations
 
-- **Signing is per-machine.** A development-signed app only counts as signed on the Mac that built it. You can't distribute the built app to other people — they should clone your extension's source and run this script themselves. Public distribution requires a paid Apple Developer account and notarization; nothing scriptable gets around that.
-- **Not every Chrome API exists in Safari.** The converter warns about unsupported `manifest.json` keys during conversion — read its output. Check [Safari's WebExtension API support](https://developer.apple.com/documentation/safariservices/safari_web_extensions) for details.
-- **Free certificates expire after about a year.** Re-run the script to re-sign when that happens.
+- **Signing is per-machine.** A development-signed app only counts as signed on the Mac that built it. You can't distribute the built app to other people — they should clone this repo and run `install` themselves. Public distribution requires a paid Apple Developer account and notarization; nothing scriptable gets around that.
+- **Not every Chrome API exists in Safari.** The converter warns about unsupported `manifest.json` keys during conversion — read its output. Check [Safari's WebExtension API support](https://developer.apple.com/documentation/safariservices/safari_web_extensions) for details. Safari-only fixes belong in the `safari/` overlay.
+- **Free certificates expire after about a year.** Re-run `install` to re-sign when that happens.
 
 ## Troubleshooting
 
 - **"No Apple Development certificate found"** — do the one-time setup above.
 - **Extension doesn't appear in Safari** — quit and reopen Safari, then check Safari → Settings → Extensions. Make sure the wrapper app ran at least once.
 - **Multiple certificates / wrong team** — pass `TEAM_ID=XXXXXXXXXX` explicitly. Find yours with `security find-identity -v -p codesigning`.
+- **Update stopped on a conflict** — that's the system working. Follow the printed steps: resolve, `git cherry-pick --continue`, then `git checkout -B main`.
 
 ## Privacy & Terms
 
