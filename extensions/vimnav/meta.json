@@ -1,0 +1,10 @@
+{
+  "slug": "vimnav",
+  "app_name": "VimNav",
+  "bundle_id": "com.converted.vimnav",
+  "origin": "local",
+  "store_url": null,
+  "extension_id": null,
+  "upstream_version": "1.0.0",
+  "added": "2026-08-23"
+}

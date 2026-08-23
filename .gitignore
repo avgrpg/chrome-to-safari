@@ -1,5 +1,4 @@
 .DS_Store
-*-safari/
 .ui/
-output/
-extension/
+# generated Xcode projects are disposable: regenerated from src/ + safari/ on every install
+extensions/*/project/
