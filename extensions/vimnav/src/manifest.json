@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VimNav",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Lightweight vim navigation for browsing. Enter normal mode, then use vim motions to scroll and jump around.",
   "permissions": ["storage"],
   "icons": {

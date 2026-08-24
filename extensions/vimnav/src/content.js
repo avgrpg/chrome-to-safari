@@ -47,9 +47,7 @@
     if (document.activeElement && isEditable(document.activeElement)) {
       document.activeElement.blur();
     }
-    showStatus(
-      "NORMAL   j k h l scroll   d u half-page   gg G top/bottom   f links   Esc leave"
-    );
+    showStatus("NORMAL");
   };
 
   const exitNormal = () => {
@@ -119,6 +117,22 @@
         break;
       case "F":
         startHint(true);
+        break;
+      case "H":
+        showStatus("HISTORY  ←");
+        history.back();
+        setTimeout(() => mode === "normal" && showStatus("NORMAL"), 600);
+        break;
+      case "L":
+        showStatus("HISTORY  →");
+        history.forward();
+        setTimeout(() => mode === "normal" && showStatus("NORMAL"), 600);
+        break;
+      case "?":
+        showStatus(
+          "j↓ k↑ h← l→   d/u ½page   gg/G top·bottom   f links   H/L history   ? help   Esc exit"
+        );
+        setTimeout(() => mode === "normal" && showStatus("NORMAL"), 4000);
         break;
       default:
         break;
@@ -223,7 +237,7 @@
       it.badge = badge;
     }
     mode = "hint";
-    showStatus("HINTS   type letters   Esc cancel");
+    hideStatus();
     hint.raf = requestAnimationFrame(paintHints);
   };
 
