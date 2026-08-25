@@ -96,6 +96,16 @@ try {
 }
 
 try {
+  importScripts(chrome.runtime.getURL('src/shared/lumno-history.js'));
+  // Safari: invalidate local-search caches whenever our self-tracked history store changes.
+  if (typeof LumnoHistory !== 'undefined' && typeof LumnoHistory.setOnChange === 'function') {
+    LumnoHistory.setOnChange(invalidateLocalSearchSourceCaches);
+  }
+} catch (error) {
+  console.warn('Lumno: failed to load history store.', error);
+}
+
+try {
   importScripts(chrome.runtime.getURL('src/background/tab-groups.js'));
 } catch (error) {
   console.warn('Lumno: failed to load tab group helpers.', error);
@@ -6638,6 +6648,18 @@ function dispatchBackgroundMessage(request, sender, sendResponse) {
 // Listen for extension runtime messages.
 chrome.runtime.onMessage.addListener(dispatchBackgroundMessage);
 
+// LumnoHistory capture: the history-capture content script reports visits; we
+// persist them into the self-tracked IndexedDB store (Safari has no chrome.history).
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.action === 'lumnoHistoryVisit') {
+    if (typeof LumnoHistory !== 'undefined' && typeof LumnoHistory.recordVisit === 'function') {
+      LumnoHistory.recordVisit(message.payload || {}).catch(() => {});
+    }
+    return false;
+  }
+  return false;
+});
+
 function handleTabMessage(request, sender, sendResponse) {
   switch (request.action) {
     case 'switchToTab': {
@@ -7091,17 +7113,13 @@ function deleteHistoryUrlFromSearch(targetUrl, sendResponse) {
     sendResponse({ ok: false, reason: 'invalid-url' });
     return;
   }
-  if (!chrome.history || typeof chrome.history.deleteUrl !== 'function') {
-    sendResponse({ ok: false, reason: 'history-api-unavailable' });
-    return;
-  }
-  chrome.history.deleteUrl({ url: targetUrl }, () => {
-    if (chrome.runtime && chrome.runtime.lastError) {
-      sendResponse({ ok: false, reason: chrome.runtime.lastError.message || 'delete-history-failed' });
-      return;
+  safeHistoryDeleteUrl(targetUrl).then((result) => {
+    if (result && result.ok) {
+      invalidateLocalSearchSourceCaches();
     }
-    invalidateLocalSearchSourceCaches();
-    sendResponse({ ok: true, url: targetUrl });
+    sendResponse(result || { ok: false, reason: 'delete-failed' });
+  }).catch((e) => {
+    sendResponse({ ok: false, reason: (e && e.message) || 'delete-failed' });
   });
   return true;
 }
@@ -9773,17 +9791,20 @@ function invalidateLocalSearchSourceCaches() {
 }
 
 function ensureLocalSearchSourceCacheListeners() {
-  if (localSearchSourceCacheListenersBound || !chrome || !chrome.history) {
+  if (localSearchSourceCacheListenersBound) {
     return;
   }
-  [
-    chrome.history.onVisited,
-    chrome.history.onVisitRemoved
-  ].forEach((eventTarget) => {
-    if (eventTarget && typeof eventTarget.addListener === 'function') {
-      eventTarget.addListener(invalidateLocalSearchSourceCaches);
-    }
-  });
+  // Chrome/Firefox: native history events invalidate our caches.
+  if (chrome && chrome.history && chrome.history.onVisited) {
+    [
+      chrome.history.onVisited,
+      chrome.history.onVisitRemoved
+    ].forEach((eventTarget) => {
+      if (eventTarget && typeof eventTarget.addListener === 'function') {
+        eventTarget.addListener(invalidateLocalSearchSourceCaches);
+      }
+    });
+  }
   localSearchSourceCacheListenersBound = true;
 }
 
@@ -9939,13 +9960,47 @@ function getTopSitesCached() {
   }, [], LOCAL_SUGGEST_SOURCE_TIMEOUT_MS).catch(() => []);
 }
 
+// Safari-compatible history access. Prefers native chrome.history when present
+// (Chrome/Firefox); otherwise falls back to the self-tracked LumnoHistory store.
+function safeHistorySearch(opts) {
+  if (typeof chrome !== 'undefined' && chrome.history && typeof chrome.history.search === 'function') {
+    return callChromeApiWithTimeout((done) => {
+      chrome.history.search(opts, done);
+    }, [], LOCAL_SUGGEST_SOURCE_TIMEOUT_MS).catch(() => []);
+  }
+  if (typeof LumnoHistory !== 'undefined' && typeof LumnoHistory.search === 'function') {
+    return LumnoHistory.search(opts).catch(() => []);
+  }
+  return Promise.resolve([]);
+}
+
+function safeHistoryDeleteUrl(targetUrl) {
+  if (!targetUrl) {
+    return Promise.resolve({ ok: false, reason: 'invalid-url' });
+  }
+  if (typeof chrome !== 'undefined' && chrome.history && typeof chrome.history.deleteUrl === 'function') {
+    return new Promise((resolve) => {
+      chrome.history.deleteUrl({ url: targetUrl }, () => {
+        if (chrome.runtime && chrome.runtime.lastError) {
+          resolve({ ok: false, reason: chrome.runtime.lastError.message || 'delete-history-failed' });
+          return;
+        }
+        resolve({ ok: true, url: targetUrl });
+      });
+    });
+  }
+  if (typeof LumnoHistory !== 'undefined' && typeof LumnoHistory.deleteUrl === 'function') {
+    return LumnoHistory.deleteUrl({ url: targetUrl })
+      .then(() => ({ ok: true, url: targetUrl }))
+      .catch((e) => ({ ok: false, reason: (e && e.message) || 'delete-failed' }));
+  }
+  return Promise.resolve({ ok: false, reason: 'history-store-unavailable' });
+}
+
 function getFallbackHistoryItemsCached(policy) {
   const now = Date.now();
   if (historyFallbackCache.expiresAt > now && Array.isArray(historyFallbackCache.items)) {
     return Promise.resolve(historyFallbackCache.items);
-  }
-  if (!chrome || !chrome.history || typeof chrome.history.search !== 'function') {
-    return Promise.resolve([]);
   }
   const settings = policy && typeof policy === 'object' ? policy : {};
   const fallbackMaxResults = Number(settings.fallbackHistoryMaxResults) > 0
@@ -9955,18 +10010,18 @@ function getFallbackHistoryItemsCached(policy) {
     ? Number(settings.fallbackHistoryWindowDays)
     : 365;
   return callChromeApiWithTimeout((done) => {
-    chrome.history.search({
+    safeHistorySearch({
       text: '',
       maxResults: fallbackMaxResults,
       startTime: Date.now() - (fallbackWindowDays * 24 * 60 * 60 * 1000)
-    }, (items) => {
+    }).then((items) => {
       const list = Array.isArray(items) ? items : [];
       historyFallbackCache = {
         items: list,
         expiresAt: Date.now() + HISTORY_FALLBACK_CACHE_TTL_MS
       };
       done(list);
-    });
+    }).catch(() => done([]));
   }, [], LOCAL_SUGGEST_SOURCE_TIMEOUT_MS).catch(() => []);
 }
 
@@ -10247,14 +10302,12 @@ async function getSearchSuggestions(query, options) {
       searchSelectionStats
     ] = await Promise.all([
       allowHistory
-        ? callChromeApiWithTimeout((done) => {
-          chrome.history.search({
+        ? safeHistorySearch({
             text: context.lookupQuery,
             maxResults: lookupMaxResults,
             startTime: lookupStartTime,
             endTime: lookupEndTime
-          }, done);
-        }, [], LOCAL_SUGGEST_SOURCE_TIMEOUT_MS)
+          })
         : Promise.resolve([]),
       allowTopSites ? getTopSitesCached() : Promise.resolve([]),
       allowBookmarks

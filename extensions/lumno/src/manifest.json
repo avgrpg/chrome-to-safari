@@ -116,18 +116,24 @@
             "*://*.youtube.com/*",
             "*://youtube.com/*"
          ],
-         "js": [
-            "src/shared/settings.js",
-            "src/content/youtube-auto-pip.js"
-         ],
-         "run_at": "document_idle"
-      }
-   ],
-   "description": "__MSG_ext_description__",
-   "chrome_url_overrides": {
-      "newtab": "newtab.html"
-   },
-   "host_permissions": [
+          "js": [
+             "src/shared/settings.js",
+             "src/content/youtube-auto-pip.js"
+          ],
+          "run_at": "document_idle"
+       },
+       {
+          "matches": [
+             "<all_urls>"
+          ],
+          "js": [
+             "src/content/history-capture.js"
+          ],
+          "run_at": "document_idle"
+       }
+    ],
+    "description": "__MSG_ext_description__",
+    "host_permissions": [
       "<all_urls>"
    ],
    "icons": {
@@ -180,16 +186,10 @@
    "default_locale": "zh_CN",
    "name": "__MSG_ext_name__",
    "author": "Kubai087",
-   "permissions": [
-      "scripting",
-      "tabs",
-      "tabGroups",
-      "history",
-      "topSites",
-      "bookmarks",
-      "storage",
-      "search",
-      "favicon"
-   ],
+    "permissions": [
+       "scripting",
+       "tabs",
+       "storage"
+    ],
    "version": "0.9.52"
 }

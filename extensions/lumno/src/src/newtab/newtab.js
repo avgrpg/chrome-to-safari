@@ -12417,17 +12417,25 @@
     });
 
     const readHistoryItems = () => new Promise((resolve) => {
-      if (!chrome.history || !chrome.history.search) {
-        resolve(null);
+      if (typeof LumnoHistory !== 'undefined' && typeof LumnoHistory.search === 'function') {
+        LumnoHistory.search({
+          text: '',
+          maxResults: 60,
+          startTime: Date.now() - 1000 * 60 * 60 * 24 * 30
+        }).then((items) => resolve(Array.isArray(items) ? items : [])).catch(() => resolve([]));
         return;
       }
-      chrome.history.search({
-        text: '',
-        maxResults: 60,
-        startTime: Date.now() - 1000 * 60 * 60 * 24 * 30
-      }, (items) => {
-        resolve(chrome.runtime.lastError || !Array.isArray(items) ? null : items);
-      });
+      if (chrome && chrome.history && chrome.history.search) {
+        chrome.history.search({
+          text: '',
+          maxResults: 60,
+          startTime: Date.now() - 1000 * 60 * 60 * 24 * 30
+        }, (items) => {
+          resolve(chrome.runtime.lastError || !Array.isArray(items) ? null : items);
+        });
+        return;
+      }
+      resolve([]);
     });
 
     const mergeWithTabsIfNeeded = (sources, mergeMode) => {
